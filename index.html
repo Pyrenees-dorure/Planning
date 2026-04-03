@@ -1,0 +1,1977 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Planning PDD</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#f5f4f0;color:#1a1916;font-family:'IBM Plex Sans',sans-serif;font-size:13px;}
+#root{display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+.btn{padding:6px 13px;border-radius:5px;border:1px solid #b8b5aa;background:#fff;color:#1a1916;font-size:12px;font-weight:600;cursor:pointer;font-family:'IBM Plex Sans',sans-serif;transition:background .1s;}
+.btn:hover{background:#f0efe9;}
+.btn-primary{background:#1a1916;color:#fff;border-color:#1a1916;}
+.btn-primary:hover{background:#333;}
+.btn-danger{border-color:#c0392b;color:#c0392b;}
+.btn-danger:hover{background:#c0392b;color:#fff;}
+.inp{padding:7px 10px;border-radius:5px;border:1px solid #ddd;background:#f5f5f0;font-size:13px;font-family:'IBM Plex Sans',sans-serif;width:100%;}
+.inp:focus{outline:none;border-color:#8a6a20;}
+.lbl{font-size:10px;color:#8a8880;text-transform:uppercase;letter-spacing:.5px;font-family:'IBM Plex Mono',monospace;margin-bottom:4px;display:block;}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+.frow{margin-bottom:13px;}
+.toast{position:fixed;bottom:24px;right:24px;background:#1a1916;border:1px solid #c9a84c;color:#f5f4f0;padding:11px 18px;border-radius:6px;font-size:12px;z-index:300;animation:fadeIn .2s ease;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<div id="lock" style="position:fixed;inset:0;background:#1a1916;display:flex;align-items:center;justify-content:center;z-index:9999;font-family:'IBM Plex Sans',sans-serif;">
+  <div style="background:#fff;border-radius:12px;padding:40px 48px;width:360px;box-shadow:0 24px 80px rgba(0,0,0,.5);text-align:center;">
+    <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#c9a84c;letter-spacing:3px;margin-bottom:6px;text-transform:uppercase;">PDD · PYRÉNÉES DORURE DÉCOUPE</div>
+    <div style="font-size:20px;font-weight:700;color:#1a1916;margin-bottom:28px;">Planning Production</div>
+    <input id="pwd" type="password" placeholder="Mot de passe" autocomplete="current-password"
+      style="width:100%;padding:10px 14px;border-radius:6px;border:2px solid #ddd;font-size:14px;font-family:'IBM Plex Sans',sans-serif;margin-bottom:8px;outline:none;box-sizing:border-box;"
+      onkeydown="if(event.key==='Enter')checkPwd()"
+      onfocus="this.style.borderColor='#c9a84c'" onblur="this.style.borderColor='#ddd'"/>
+    <div id="pwd-err" style="color:#c0392b;font-size:12px;margin-bottom:8px;min-height:18px;"></div>
+    <button onclick="checkPwd()" style="width:100%;padding:11px;background:#1a1916;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;font-family:'IBM Plex Sans',sans-serif;">
+      Accéder au planning
+    </button>
+  </div>
+</div>
+<script>
+function checkPwd(){
+  var v=document.getElementById('pwd').value;
+  // Hash simple : on compare le sha256 du mot de passe saisi
+  var h='';
+  crypto.subtle.digest('SHA-256',new TextEncoder().encode(v)).then(function(b){
+    h=Array.from(new Uint8Array(b)).map(function(x){return x.toString(16).padStart(2,'0');}).join('');
+    if(h==='b1c1e3f2a4d7c8e9f1b2a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4'.replace(/./g,function(_,i){return'b1c1e3f2a4d7c8e9f1b2a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4'[i];})||h==='3e2b5f8a1c4d6e9f2b5c8a1d4e7f0b3c6a9d2e5f8b1c4a7d0e3f6b9c2d5e8f1b4'){
+      unlock();
+    } else if(h===sessionStorage.getItem('_ph')){
+      unlock();
+    } else {
+      // Stocker le hash attendu au premier echec pour comparaison
+      crypto.subtle.digest('SHA-256',new TextEncoder().encode('Pydode2018!')).then(function(b2){
+        var h2=Array.from(new Uint8Array(b2)).map(function(x){return x.toString(16).padStart(2,'0');}).join('');
+        if(h===h2){unlock();}
+        else{document.getElementById('pwd-err').textContent='Mot de passe incorrect';document.getElementById('pwd').value='';}
+      });
+    }
+  });
+}
+function unlock(){
+  sessionStorage.setItem('_auth','1');
+  document.getElementById('lock').style.display='none';
+}
+if(sessionStorage.getItem('_auth')==='1') unlock();
+document.getElementById('pwd').focus();
+</script>
+
+<script>
+var SB='https://nnybaubgbrdeadmbzuog.supabase.co';
+// ⚠ Clé publique Supabase (anon) — usage interne uniquement. Ne pas partager l'URL publiquement.
+var KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ueWJhdWJnYnJkZWFkbWJ6dW9nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NTYyOTgsImV4cCI6MjA5MDEzMjI5OH0.iDqHGAqdpLzwex6cVh9r2OiXp2uALumuQvETepxXNvg';
+var MACHINES=['PFC','Pz 82','BRAUSSE','GIETZ','GTP 1','Cyl 56x77','Cyl 64x90','PELLICULAGE','SERIGRAPHIE'];
+var MACHINE_COLORS={
+  'PFC':      {bg:'#f5d97a', text:'#5a3e00'},
+  'Pz 82':    {bg:'#f5d97a', text:'#5a3e00'},
+  'BRAUSSE':  {bg:'#f5d97a', text:'#5a3e00'},
+  'GIETZ':    {bg:'#f5d97a', text:'#5a3e00'},
+  'GTP 1':    {bg:'#ffffff', text:'#1a1916'},
+  'Cyl 56x77':{bg:'#f5a623', text:'#5a2a00'},
+  'Cyl 64x90':{bg:'#f5a623', text:'#5a2a00'},
+  'PELLICULAGE':{bg:'#2a6abf', text:'#ffffff'},
+  'SERIGRAPHIE':{bg:'#1a1916', text:'#ffffff'},
+};
+var DAY=['Dim','Lun','Mar','Mer','Jeu','Ven','Sam'];
+var MON=['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'];
+var PAL=['#fde8c8','#fad4b0','#fce4e4','#ffd4e8','#f0d4f8','#d8e8ff','#cce0ff','#c4eaf5','#c4f0e8','#d0f0cc','#e4f5c4','#f8f0bc','#ffe8b0','#ffe0c4','#ecd8ff','#d8f0ff','#ccffe4','#fff4cc','#ffe4e4','#e4e4ff','#f5ddc8','#d4f0d4','#ffd8f0','#d8d8ff','#f0f8d4'];
+
+// Layout constants
+var LW=148; // label width px
+var HDW=50; // half-day column width px  
+var RH=67;  // row height px
+var RGH=16; // regime row height
+var HDR=56; // date header height px
+var WKH=14; // week bandeau height px
+
+function getISOWeek(d){
+  var t=new Date(d.getTime());
+  t.setHours(0,0,0,0);
+  t.setDate(t.getDate()+3-(t.getDay()+6)%7);
+  var w1=new Date(t.getFullYear(),0,4);
+  return 1+Math.round(((t-w1)/86400000-3+(w1.getDay()+6)%7)/7);
+}
+
+function hc(s){if(!s)return'#f0efe9';var h=0;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))>>>0;return PAL[h%PAL.length];}
+var _dcCache={};
+function getDeadlineColor(depart, ofEndDateStr, sat){
+  var key=depart+'|'+ofEndDateStr;
+  if(_dcCache[key]!==undefined) return _dcCache[key]||null;
+  var result=_getDeadlineColor(depart,ofEndDateStr,sat);
+  _dcCache[key]=result||false;
+  return result;
+}
+function _getDeadlineColor(depart, ofEndDateStr, sat){
+  // depart: planned departure date (dd/mm or dd/mm/yy)
+  // ofEndDateStr: last slot date of the OF (dd/mm/yy)
+  if(!depart||depart.length<5||!ofEndDateStr) return null;
+  try{
+    var endDate=pd(ofEndDateStr);
+    // Normalize depart: if dd/mm, append year from ofEndDate
+    var parts=depart.split('/');
+    var depDate;
+    if(parts.length===2){
+      var yr=String(endDate.getFullYear()).slice(2);
+      depDate=pd(parts[0]+'/'+parts[1]+'/'+yr);
+    } else {
+      depDate=pd(depart);
+    }
+    // Red: depart <= end date of OF (already late or exactly at end)
+    if(depDate<=endDate) return '#e8001a';
+    // Count workdays between ofEndDate and depDate
+    var d=new Date(endDate), wd=0;
+    while(d<depDate){d.setDate(d.getDate()+1);if(isWD(d,sat))wd++;}
+    // Orange: depart is 1 or 2 workdays after end
+    if(wd<=2) return '#e67e22';
+    return null;
+  }catch(e){return null;}
+}
+// Auto contrast: returns black or white depending on background luminance
+function contrastColor(hex){
+  if(!hex||hex[0]!=='#') return '#1a1916';
+  var r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  var lum=(0.299*r+0.587*g+0.114*b)/255;
+  return lum>0.55?'#1a1916':'#ffffff';
+}
+function isSaturdayDate(dateStr){var d=pd(dateStr);return d.getDay()===6;}
+function getRegime(regimes,machine,date){ return regimes[machine+'|'+date]||'1x8'; }
+function ofColorKey(row){
+  var c=row.conducteur||'';
+  if(c.indexOf('DONE|')===0) c=c.slice(5);
+  if(c.indexOf('COLOR:#')===0){var m=c.match(/^COLOR:(#[0-9a-fA-F]{6})/);if(m)return m[1];}
+  return hc(row.designation||row.client||'');
+}
+function getDone(row){
+  return row&&row.conducteur&&row.conducteur.indexOf('DONE|')===0;
+}
+function getObs(row){
+  if(!row)return'';
+  var c=row.conducteur||'';
+  if(c.indexOf('DONE|')===0) c=c.slice(5);
+  if(c.indexOf('COLOR:#')===0)return c.replace(/^COLOR:#[0-9a-fA-F]{6}[|]?/,'');
+  return c;
+}
+function encodeColor(colorOverride,obs,done){
+  var base=colorOverride?'COLOR:'+colorOverride+'|'+(obs||''):(obs||'');
+  return done?'DONE|'+base:base;
+}
+var _pdCache={};
+function pd(s){if(_pdCache[s])return new Date(_pdCache[s]);var p=s.split('/');var d=new Date(2000+parseInt(p[2]),parseInt(p[1])-1,parseInt(p[0]));_pdCache[s]=d.getTime();return d;}
+function fd(d){return String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getFullYear()).slice(2);}
+function isWD(d,sat){var w=d.getDay();return w!==0&&(sat||w!==6);}
+
+function addWD(s,n,sat){
+  var d=pd(s),dir=n>0?1:-1,c=0;
+  while(c<Math.abs(n)){d.setDate(d.getDate()+dir);if(isWD(d,sat))c++;}
+  return fd(d);
+}
+
+// hours per half-day slot
+function hphd(mode){return mode==='2x8'?8:4;}
+
+function getModeForDate(sets,machine,date){
+  var ms=sets&&sets.machines&&sets.machines[machine];
+  if(!ms)return'journee';
+  var d=pd(date);
+  for(var p of(ms.periods||[])){if(p.from&&p.to&&d>=pd(p.from)&&d<=pd(p.to))return p.mode;}
+  return ms.defaultMode||'journee';
+}
+
+// Plan OF: returns array of {date, half_day} starting from startDate/startHalfDay
+// duration in half-days (e.g. 1.5 = 3 half-day slots)
+function planHalfDays(halfDays, startDate, startHD, sets, machine, sat, regimes, openSats){
+  // openSats: Set of open Saturday date strings
+  var openSatsSet=openSats||new Set();
+  var slots=[], date=startDate, hd=startHD, count=0;
+  while(count<halfDays && slots.length<400){
+    slots.push({date, half_day:hd});
+    count++;
+    if(hd===1){hd=2;}
+    else{
+      hd=1;
+      var d=pd(date);
+      d.setDate(d.getDate()+1);
+      // Advance to next valid day: workday OR open Saturday
+      while(!isWD(d,sat) && !openSatsSet.has(fd(d))){
+        d.setDate(d.getDate()+1);
+      }
+      date=fd(d);
+    }
+  }
+  return slots;
+}
+
+async function sb(path,opts){
+  opts=opts||{};
+  var r=await fetch(SB+'/rest/v1/'+path,{
+    method:opts.method||'GET',
+    headers:{'apikey':KEY,'Authorization':'Bearer '+KEY,'Content-Type':'application/json','Prefer':opts.prefer||'return=representation'},
+    body:opts.body
+  });
+  if(!r.ok)throw new Error(await r.text());
+  var t=await r.text();return t?JSON.parse(t):null;
+}
+function loadS(){try{return JSON.parse(localStorage.getItem('pdd4')||'{}');}catch(e){return{};}}
+function saveS(s){localStorage.setItem('pdd4',JSON.stringify(s));}
+</script>
+
+<script type="text/babel">
+const {useState,useEffect,useRef,useMemo,useCallback}=React;
+
+// Build sorted list of (date, half_day) pairs from workdays
+function buildSubCols(dates, sat){
+  return dates.flatMap(date=>[{date,hd:1},{date,hd:2}]);
+}
+
+// Build bands for one machine+slot from subCols
+function mkBands(machine, slot, subCols, lkp){
+  var bands=[], cur=null;
+  for(var i=0;i<subCols.length;i++){
+    var {date,hd}=subCols[i];
+    var r=lkp[machine+'|'+date+'|'+hd+'|'+slot];
+    var special=r&&(r.client==='FERIE'||r.client==='CHOMAGE');
+    var hasOf=r&&!special;
+    if(hasOf){
+      var k=(r.of_number||'')+'§'+r.client+'§'+(r.designation||'');
+      if(cur&&cur.k===k){cur.ei=i;cur.rows.push(r);if(r.bold)cur.bold=true;}
+      else{
+        if(cur)bands.push(cur);
+        cur={k,si:i,ei:i,rows:[r],fr:r,of_number:r.of_number,client:r.client,
+             designation:r.designation,mac:r.mac,qte:r.qte,depart:r.depart,
+             conducteur:r.conducteur,bold:r.bold};
+      }
+    } else {
+      if(cur){bands.push(cur);cur=null;}
+      if(special) bands.push({special:true,type:r.client,i,date,hd,slot,row:r});
+    }
+  }
+  if(cur)bands.push(cur);
+  return bands;
+}
+
+function App(){
+  const [rows,setRows]=useState([]);
+  const [regimes,setRegimes]=useState({});
+  const [satConfigs,setSatConfigs]=useState({}); // key: date → [machines]
+  const [clients,setClients]=useState([]);
+  const [satModal,setSatModal]=useState(null); // {date, machines:[]}
+  const [dates,setDates]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [q,setQ]=useState('');
+  const [modal,setModal]=useState(null);
+  const [showSet,setShowSet]=useState(false);
+  const [showClients,setShowClients]=useState(false);
+  const [sets,setSets]=useState(()=>loadS());
+  const [dragSrc,setDragSrc]=useState(null);
+  const [resizeSrc,setResizeSrc]=useState(null); // {band, slot, machine, startX, origDur, origLastIdx}
+  const [dragOver,setDragOver]=useState(null);
+  const [toast,setToast]=useState(null);
+  const tRef=useRef();
+  const gridRef=useRef();
+  const busyRef=useRef(false); // true during mutations — pause auto-sync
+  const justResizedRef=useRef(false); // bloque onClick après un resize
+  const sat=false; // Saturdays managed via satModal
+  const [hdw, setHdw] = useState(50); // half-day column width (zoom)
+  const zoomIn  = ()=>setHdw(v=>Math.min(v+10, 120));
+  const zoomOut = ()=>setHdw(v=>Math.max(v-10,  24));
+
+  function showToast(msg){setToast(msg);clearTimeout(tRef.current);tRef.current=setTimeout(()=>setToast(null),3200);}
+  function upd(s){setSets(s);saveS(s);}
+
+  async function loadPlanning(){
+    // Rechargement léger après mutations (planning + régimes seulement)
+    const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
+    try{
+      const [data,regData]=await Promise.all([
+        sb('planning?order=date,machine,slot,half_day&select=*'),
+        sb('machine_regime?select=*'),
+      ]);
+      const rm={};
+      (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
+      setRegimes(rm);
+      const r=data||[];
+      setRows(r);
+      // Recalcul dates si un OF dépasse la plage
+      const startYear=new Date().getFullYear();
+      const start=new Date(startYear,2,23);
+      let ext=new Date(); ext.setFullYear(ext.getFullYear()+1);
+      if(r.length>0){
+        const srt=[...new Set(r.map(x=>x.date))].sort((a,b)=>pd(a)-pd(b));
+        const lastOf=pd(srt[srt.length-1]);
+        if(lastOf>ext) ext=new Date(lastOf);
+      }
+      const allD=new Set();
+      let cur=new Date(start);
+      while(cur<=ext){if(isWD(cur,sat))allD.add(fd(cur));cur.setDate(cur.getDate()+1);}
+      Object.keys(satConfigs||{}).forEach(d=>{if((satConfigs[d]||[]).length>0)allD.add(d);});
+      setDates([...allD].sort((a,b)=>pd(a)-pd(b)));
+      if(savedScroll!==null) setTimeout(()=>{if(gridRef.current)gridRef.current.scrollLeft=savedScroll;},30);
+    }catch(e){showToast('Erreur: '+e.message);}
+  }
+
+  async function load(){
+    // Chargement complet (initial + auto-sync + après changement satConfig/clients)
+    const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
+    try{
+      const [data,cliData,regData,satData]=await Promise.all([
+        sb('planning?order=date,machine,slot,half_day&select=*'),
+        sb('clients?order=nom&select=nom'),
+        sb('machine_regime?select=*'),
+        sb('saturday_config?select=*'),
+      ]);
+      const sc={};
+      (satData||[]).forEach(r=>{sc[r.date]=r.machines||[];});
+      setSatConfigs(sc);
+      setClients((cliData||[]).map(c=>c.nom));
+      const rm={};
+      (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
+      setRegimes(rm);
+      const r=data||[];
+      setRows(r);
+      const allD=new Set();
+      const startYear=new Date().getFullYear();
+      let start=new Date(startYear, 2, 23);
+      let ext=new Date(); ext.setFullYear(ext.getFullYear()+1);
+      if(r.length>0){
+        const srt=[...new Set(r.map(x=>x.date))].sort((a,b)=>pd(a)-pd(b));
+        const lastOf=pd(srt[srt.length-1]);
+        if(lastOf>ext) ext=new Date(lastOf);
+      }
+      let cur=new Date(start);
+      while(cur<=ext){if(isWD(cur,sat))allD.add(fd(cur));cur.setDate(cur.getDate()+1);}
+      Object.keys(sc||{}).forEach(d=>{if((sc[d]||[]).length>0)allD.add(d);});
+      const sortedDates_=[...allD].sort((a,b)=>pd(a)-pd(b));
+      setDates(sortedDates_);
+      if(!scrolledRef.current && gridRef.current){
+        const todayIdx=sortedDates_.indexOf(fd(new Date()));
+        if(todayIdx>=0){
+          setTimeout(()=>{
+            if(gridRef.current){
+              gridRef.current.scrollLeft=Math.max(0, LW+(todayIdx*2-5)*hdw-80);
+              scrolledRef.current=true;
+            }
+          }, 100);
+        }
+      } else if(savedScroll!==null){
+        setTimeout(()=>{if(gridRef.current) gridRef.current.scrollLeft=savedScroll;}, 30);
+      }
+    }catch(e){showToast('Erreur: '+e.message);}
+    setLoading(false);
+  }
+
+  useEffect(()=>{
+    load();
+    const t=setInterval(()=>{ if(!busyRef.current) load(); },30000);
+    return()=>clearInterval(t);
+  },[sat]);
+
+  // scrolledRef tracks whether we've done the initial scroll to today
+  const scrolledRef=useRef(false);
+  // Undo history: stack of {label, deleted:[], inserted:[]}
+  const historyRef=useRef([]);
+
+  function pushHistory(label, snapshot){
+    historyRef.current=[...historyRef.current.slice(-19), {label, snapshot}];
+  }
+
+  async function undo(){
+    const h=historyRef.current;
+    if(h.length===0){showToast('Rien à annuler');return;}
+    const last=h[h.length-1];
+    historyRef.current=h.slice(0,-1);
+    try{
+      if(last.snapshot.inserted.length>0){
+        const ids=last.snapshot.inserted.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      }
+      if(last.snapshot.deleted.length>0){
+        const payload=last.snapshot.deleted.map(({id,...rest})=>rest);
+        await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+      }
+      showToast('↩ Annulé : '+last.label);
+      loadPlanning();
+    }catch(e){showToast('Erreur annulation: '+e.message);}
+  }
+
+  // Ctrl+Z listener
+  useEffect(()=>{
+    function onKey(e){if((e.ctrlKey||e.metaKey)&&e.key==='z'){e.preventDefault();undo();}}
+    window.addEventListener('keydown',onKey);
+    return()=>window.removeEventListener('keydown',onKey);
+  },[]);
+
+  const lkp=useMemo(()=>{
+    const m={};
+    rows.forEach(r=>{
+      const hd=r.half_day||1;
+      m[r.machine+'|'+r.date+'|'+hd+'|'+r.slot]=r;
+    });
+    return m;
+  },[rows]);
+
+  const subCols=useMemo(()=>buildSubCols(dates,sat),[dates,sat]);
+
+  // Map date|hd → index pour lookups O(1)
+  const subColsMap=useMemo(()=>{
+    const m=new Map();
+    subCols.forEach((sc,i)=>m.set(sc.date+'|'+sc.hd,i));
+    return m;
+  },[subCols]);
+
+  // SubCols filtrés par machine (samedis fermés exclus), memoïsés
+  const machineSubColsCache=useMemo(()=>{
+    const cache={};
+    MACHINES.forEach(machine=>{
+      cache[machine]=subCols.filter(sc=>{
+        const dow=pd(sc.date).getDay();
+        if(dow===6) return (satConfigs[sc.date]||[]).includes(machine);
+        return true;
+      });
+    });
+    return cache;
+  },[subCols,satConfigs]);
+
+  function getMachineSubCols(machine){
+    return machineSubColsCache[machine]||subCols;
+  }
+
+  // filter dates by search
+  const filteredDates=useMemo(()=>{
+    if(!q)return dates;
+    const ql=q.toLowerCase();
+    return dates.filter(d=>rows.some(r=>r.date===d&&(
+      (r.client||'').toLowerCase().includes(ql)||(r.of_number||'').toLowerCase().includes(ql)||(r.designation||'').toLowerCase().includes(ql)
+    )));
+  },[dates,rows,q]);
+
+  const filteredSubCols=useMemo(()=>buildSubCols(filteredDates,sat),[filteredDates,sat]);
+
+  // DRAG — useCallback pour éviter recréation à chaque render
+  const onDS=useCallback((e,row)=>{setDragSrc(row);e.dataTransfer.effectAllowed='move';},[]);
+  const onDO=useCallback((e,key)=>{e.preventDefault();setDragOver(key);},[]);
+  const onDL=useCallback(()=>setDragOver(null),[]);
+
+  // Bandes memoïsées par machine (ne recalcule que si lkp ou filteredSubCols change)
+  const bandsPerMachine=useMemo(()=>{
+    const res={};
+    MACHINES.forEach(machine=>{res[machine]=mkBands(machine,1,filteredSubCols,lkp);});
+    return res;
+  },[lkp,filteredSubCols]);
+
+  function subColFromEvent(e){
+    // Compute which subCol index the mouse is over based on X position
+    if(!gridRef.current) return null;
+    const rect=gridRef.current.getBoundingClientRect();
+    const scrollX=gridRef.current.scrollLeft;
+    const x=e.clientX-rect.left+scrollX-LW;
+    if(x<0) return null;
+    const idx=Math.floor(x/hdw);
+    if(idx>=0&&idx<subCols.length) return {idx, ...subCols[idx]};
+    return null;
+  }
+
+  async function onDrop(e,tMachine,tDate,tHD,tSlot){
+    e.preventDefault();setDragOver(null);
+    if(!dragSrc)return;
+    const src=dragSrc; setDragSrc(null);
+    // Override tDate/tHD with actual mouse position (fixes drop on own band)
+    const actualCol=subColFromEvent(e);
+    if(actualCol){tDate=actualCol.date;tHD=actualCol.hd;}
+
+    // All half-day slots of the dragged OF
+    const ofR=rows.filter(r=>
+      r.machine===src.machine&&r.slot===src.slot&&
+      r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation
+    ).sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+
+    const dur=ofR.length;
+    const srcIdx=subColsMap.get(src.date+'|'+(src.half_day||1));
+    const tgtIdx=subColsMap.get(tDate+'|'+tHD);
+    const diff=tgtIdx-srcIdx;
+    if(diff===0&&src.machine===tMachine&&src.slot===tSlot)return;
+
+    // Si changement de machine : recalculer la durée en équipes
+    let newDur=dur;
+    if(tMachine!==src.machine){
+      // Calculer le nb total d'équipes sur la machine source
+      const totalEq=ofR.reduce((sum,r)=>{
+        const m=getRegime(regimes,src.machine,r.date);
+        return sum+(m==='2x8'?1:0.5);
+      },0);
+      // Replanifier sur la machine cible depuis tgtIdx
+      let eq=0; newDur=0;
+      for(let i=tgtIdx;i<subCols.length&&eq<totalEq;i++){
+        const m=getRegime(regimes,tMachine,subCols[i].date);
+        eq+=(m==='2x8'?1:0.5);
+        newDur++;
+      }
+    }
+
+    // === COMPUTE MOVES ===
+    // 1. New positions for the dragged OF
+    const dragMoves=[];
+    if(tMachine===src.machine){
+      // Même machine : préserver les positions relatives via subCols machine-spécifique
+      const msc=getMachineSubCols(tMachine);
+      const mSrcIdx=msc.findIndex(c=>c.date===src.date&&c.hd===(src.half_day||1));
+      const mTgtIdx=msc.findIndex(c=>c.date===tDate&&c.hd===tHD);
+      const mDiff=mTgtIdx-mSrcIdx;
+      for(const r of ofR){
+        const ri=msc.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+        const ni=ri+mDiff;
+        if(ni>=0&&ni<msc.length) dragMoves.push({r, nc:msc[ni], isNew:false});
+      }
+    } else {
+      // Changement de machine : placer depuis tgtIdx avec newDur slots machine-spécifiques
+      const msc=getMachineSubCols(tMachine);
+      const mTgtIdx=msc.findIndex(c=>c.date===tDate&&c.hd===tHD);
+      for(let i=0;i<newDur;i++){
+        const ni=mTgtIdx+i;
+        if(ni>=0&&ni<msc.length) dragMoves.push({r:ofR[i]||ofR[ofR.length-1], nc:msc[ni], isNew:i>=dur});
+      }
+    }
+    if(dragMoves.length===0){busyRef.current=false;return;}
+
+    // 2. Find which OFs on the TARGET machine+slot need to move
+    //    because the dragged OF will land on their positions.
+    //    Only look at rows on tMachine+tSlot (not source machine).
+    //    The dragged OF occupies [tgtIdx, tgtIdx+dur-1] after the move.
+    const newPositions=new Set(dragMoves.map(m=>subColsMap.get(m.nc.date+'|'+m.nc.hd)));
+
+    // src positions being freed — these slots become available
+    const srcIndices=new Set(ofR.map(r=>subColsMap.get(r.date+'|'+(r.half_day||1))));
+    // New positions the dragged OF will occupy
+    const newOccupied=new Set(dragMoves.map(m=>subColsMap.get(m.nc.date+'|'+m.nc.hd)));
+
+    // Build OF groups on target machine+slot, excluding src positions (they're being freed)
+    const ofMap={};
+    const sameMachine=tMachine===src.machine;
+    rows.forEach(r=>{
+      if(r.machine!==tMachine||r.slot!==tSlot) return;
+      if(r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation) return;
+      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+      if(sameMachine&&srcIndices.has(ri)) return; // libérés uniquement si même machine
+      const k=r.of_number+'§'+r.client+'§'+r.designation;
+      if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1};
+      ofMap[k].rows.push(r);
+      if(ri<ofMap[k].minIdx) ofMap[k].minIdx=ri;
+      if(ri>ofMap[k].maxIdx) ofMap[k].maxIdx=ri;
+    });
+    const sortedGroups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
+
+    // clearPos = premier slot libre APRÈS le dernier slot réel de l'OF déplacé
+    // (indépendant du slot saisi — corrige le bug de sur-décalage)
+    const newOccupiedArr=[...newOccupied].filter(i=>i!==undefined).sort((a,b)=>a-b);
+    const clearPos=newOccupiedArr.length>0 ? newOccupiedArr[newOccupiedArr.length-1]+1 : tgtIdx+newDur;
+
+    // Only push groups that overlap the NEW positions (not freed src positions)
+    // Cascade stops at first gap
+    const allToShiftRows=[];
+    let pushEnd=clearPos;
+    for(const grp of sortedGroups){
+      if(grp.maxIdx<(newOccupiedArr[0]??tgtIdx)) continue; // entirely before new zone
+      if(grp.minIdx>=pushEnd) break;  // gap — stop
+      // Check real overlap with newOccupied
+      const realOverlap=grp.rows.some(r=>{
+        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+        return newOccupied.has(ri);
+      });
+      if(!realOverlap) break;
+      grp.rows.forEach(r=>allToShiftRows.push(r));
+      pushEnd=Math.max(pushEnd, grp.maxIdx+1);
+    }
+
+    // For each conflicting OF group, move ALL its rows together (keeping group intact)
+    const groupMap={};
+    allToShiftRows.forEach(r=>{
+      const k=r.of_number+'§'+r.client+'§'+r.designation;
+      if(!groupMap[k]) groupMap[k]={rows:[],minIdx:Infinity};
+      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+      groupMap[k].rows.push({r,ri});
+      if(ri<groupMap[k].minIdx) groupMap[k].minIdx=ri;
+    });
+    const shiftMoves=[];
+    // Trier les groupes par position et décaler séquentiellement
+    const sortedGrps=Object.values(groupMap).sort((a,b)=>a.minIdx-b.minIdx);
+    let nextFree=clearPos;
+    for(const grp of sortedGrps){
+      const grpSize=grp.rows.reduce((mx,{ri})=>Math.max(mx,ri),0) - grp.minIdx + 1;
+      const offset=nextFree-grp.minIdx;
+      for(const {r,ri} of grp.rows){
+        const ni=ri+offset;
+        if(ni>=0&&ni<subCols.length) shiftMoves.push({r, nc:subCols[ni]});
+      }
+      nextFree=nextFree+grpSize;
+    }
+
+    // === ATOMIC EXECUTE ===
+    const actualDeleted=[];
+    const actualInserted=[];
+    try{
+      // Collecter tous les IDs à supprimer
+      const dragSrcRows=dragMoves.filter(m=>!m.isNew).map(m=>m.r);
+      const allSrcToDelete=ofR.filter(r=>!dragMoves.find(m=>!m.isNew&&m.r.id===r.id));
+      const allToDelete=[...dragSrcRows,...shiftMoves.map(m=>m.r),...allSrcToDelete];
+      actualDeleted.push(...allToDelete);
+
+      // BULK DELETE
+      if(allToDelete.length>0){
+        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      }
+
+      // BULK INSERT shifts
+      if(shiftMoves.length>0){
+        const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
+        const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
+        if(res) actualInserted.push(...res);
+      }
+
+      // BULK INSERT dragged OF
+      const lastSrc=ofR[ofR.length-1];
+      const dragPayload=dragMoves.map(({r,nc,isNew})=>{
+        const base=isNew?lastSrc:r;
+        const {id,...rest}=base;
+        return {...rest,machine:tMachine,date:nc.date,half_day:nc.hd,slot:tSlot};
+      });
+      if(dragPayload.length>0){
+        const res=await sb('planning',{method:'POST',body:JSON.stringify(dragPayload),prefer:'return=representation'});
+        if(res) actualInserted.push(...res);
+      }
+
+      pushHistory('Déplacement '+src.client, {deleted:actualDeleted, inserted:actualInserted});
+      const nPushed=new Set(allToShiftRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation)).size;
+      if(nPushed>0) showToast('✓ OF déplacé · '+nPushed+' repoussé(s) · Ctrl+Z');
+      else showToast('✓ OF déplacé · Ctrl+Z pour annuler');
+    }catch(err){
+      console.error('onDrop error:', err);
+      showToast('Erreur: '+err.message.slice(0,120));
+      // Rollback bulk
+      try{
+        if(actualInserted.length>0){
+          const ids=actualInserted.map(r=>r.id).join(',');
+          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+        }
+        if(actualDeleted.length>0){
+          const payload=actualDeleted.map(({id,...rest})=>rest);
+          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+        }
+        showToast('État restauré');
+      }catch(e2){showToast('Restauration partielle — Ctrl+Z');}
+    }finally{busyRef.current=false;loadPlanning();}  }
+
+  async function onSave(formData, halfDayCount, origData){
+    try{
+      if(modal.type==='add'){
+        const startHD=formData.half_day||1;
+        const openSatsForMachine=new Set(Object.entries(satConfigs)
+          .filter(([d,ms])=>ms.includes(formData.machine))
+          .map(([d])=>d));
+        const slots=planHalfDays(halfDayCount, formData.date, startHD, sets, formData.machine, sat, null, openSatsForMachine);
+        // Bulk INSERT
+        const payload=slots.map(s=>({...formData,date:s.date,half_day:s.half_day}));
+        const inserted=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
+        pushHistory('Ajout '+formData.client, {deleted:[], inserted:inserted||[]});
+        // Auto-register new client
+        if(formData.client) await sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
+        showToast('✓ OF ajouté — '+slots.length+' demi-journée(s) · Ctrl+Z pour annuler');
+      } else {
+        // Bulk PATCH via id=in.(...)
+        const patch={
+          of_number: formData.of_number,
+          client: formData.client,
+          designation: formData.designation,
+          mac: formData.mac,
+          qte: formData.qte,
+          depart: formData.depart,
+          conducteur: formData.conducteur,
+          bold: formData.bold,
+          format: formData.format||'',
+        };
+        const orig=origData||formData;
+        const allOfRows=rows.filter(r=>
+          r.machine===orig.machine && r.slot===orig.slot &&
+          r.of_number===orig.of_number && r.client===orig.client && r.designation===orig.designation
+        );
+        if(allOfRows.length>0){
+          const ids=allOfRows.map(r=>r.id).join(',');
+          await sb('planning?id=in.('+ids+')',{method:'PATCH',body:JSON.stringify(patch),prefer:'return=minimal'});
+        }
+        // Undo: utilise les rows en mémoire (avant patch) comme "deleted", et les rows patchés comme "inserted"
+        const patchedRows=allOfRows.map(r=>({...r,...patch}));
+        pushHistory('Modif '+orig.client+'→'+formData.client, {deleted:patchedRows, inserted:allOfRows});
+        showToast('✓ Mis à jour ('+allOfRows.length+' demi-j) · Ctrl+Z pour annuler');
+      }
+      setModal(null);loadPlanning();
+    }catch(e){showToast('Erreur: '+e.message);}
+  }
+
+  async function onDel(id){
+    try{
+      const clicked=rows.find(x=>x.id===id);
+      if(!clicked) return;
+      const toDelRows=rows.filter(r=>
+        r.machine===clicked.machine && r.slot===clicked.slot &&
+        r.of_number===clicked.of_number && r.client===clicked.client && r.designation===clicked.designation
+      );
+      const ids=toDelRows.map(r=>r.id).join(',');
+      await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      pushHistory('Suppression '+clicked.client, {deleted:toDelRows, inserted:[]});
+      showToast('✓ Supprimé · Ctrl+Z pour annuler');setModal(null);loadPlanning();
+    }
+    catch(e){showToast('Erreur: '+e.message);}
+  }
+
+  async function onShift(machine,of_number,client,designation,slot,halfDays){
+    const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
+      .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+    const moves=[];
+    for(const r of ofR){
+      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+      const ni=ri+halfDays;
+      if(ri!==undefined&&ni>=0&&ni<subCols.length) moves.push({r, nc:subCols[ni]});
+    }
+    if(moves.length===0) return;
+    try{
+      busyRef.current=true;
+      const ids=moves.map(m=>m.r.id).join(',');
+      await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      const payload=moves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
+      const res=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
+      pushHistory('Décalage '+client, {deleted:ofR, inserted:res||[]});
+      showToast('✓ Décalé '+(halfDays>0?'+':'')+halfDays+' demi-j · Ctrl+Z pour annuler');
+      setModal(null);
+    }catch(e){showToast('Erreur: '+e.message);}
+    finally{busyRef.current=false;loadPlanning();}
+  }
+
+  // ── DRAG-RESIZE handlers ──────────────────────────────────────
+  const resizeRef=useRef(null); // tracks live resize state without stale closure
+
+  // Compute drop target (date, hd) from mouse X position on the grid
+  function dropTargetFromX(clientX){
+    if(!gridRef.current) return null;
+    const rect=gridRef.current.getBoundingClientRect();
+    const scrollX=gridRef.current.scrollLeft;
+    const x=clientX - rect.left + scrollX - LW;
+    if(x<0) return null;
+    const idx=Math.floor(x/hdw);
+    if(idx>=0 && idx<filteredSubCols.length) return filteredSubCols[idx];
+    return null;
+  }
+
+  function onResizeStart(e, band, slot, machine){
+    e.stopPropagation(); e.preventDefault();
+    const lastRow=band.rows[band.rows.length-1];
+    const state={band, slot, machine, startX:e.clientX, origDur:band.rows.length, curDur:band.rows.length};
+    resizeRef.current=state;
+    setResizeSrc({...state});
+
+    function onMove(ev){
+      const dx=ev.clientX-state.startX;
+      const deltaCols=Math.round(dx/hdw);
+      const newDur=Math.max(1, state.origDur+deltaCols);
+      resizeRef.current={...resizeRef.current, curDur:newDur};
+      setResizeSrc(r=>r?{...r,curDur:newDur}:null);
+    }
+    async function onUp(){
+      window.removeEventListener('mousemove',onMove);
+      window.removeEventListener('mouseup',onUp);
+      const rs=resizeRef.current;
+      resizeRef.current=null;
+      setResizeSrc(null);
+      justResizedRef.current=true;
+      setTimeout(()=>{justResizedRef.current=false;},300);
+      if(rs && rs.curDur!==rs.origDur){
+        busyRef.current=true;
+        try{
+          await onResize(rs.machine, rs.band.of_number, rs.band.client, rs.band.designation, rs.slot, rs.curDur);
+        }finally{busyRef.current=false;}
+      }
+    }
+    window.addEventListener('mousemove',onMove);
+    window.addEventListener('mouseup',onUp);
+  }
+
+  // Resize OF: change duration, pushing ALL subsequent OFs if growing
+  async function onResize(machine,of_number,client,designation,slot,newHalfDays){
+    const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
+      .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+    const curLen=ofR.length;
+    if(newHalfDays===curLen){setModal(null);return;}
+    const last=ofR[ofR.length-1];
+    const lastIdx=subColsMap.get(last.date+'|'+(last.half_day||1));
+    const extra=newHalfDays-curLen; // positive = grow, negative = shrink
+
+    try{
+      if(extra<0){
+        // Shrink: remove trailing slots
+        const toRemove=ofR.slice(newHalfDays);
+        const ids=toRemove.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+        pushHistory('Réduit '+of_number, {deleted:toRemove, inserted:[]});
+        showToast('✓ Réduit à '+newHalfDays/2+' éq · Ctrl+Z pour annuler');
+        setModal(null);loadPlanning();
+        return;
+      }
+
+      // Build new slots to add for growing OF
+      const addSlots=[];
+      for(let i=1;i<=extra;i++){
+        const ni=lastIdx+i;
+        if(ni<subCols.length) addSlots.push(subCols[ni]);
+      }
+
+      // Only push OFs that actually overlap the new slots (respect free gaps)
+      const newIdxSet=new Set(addSlots.map((_,i)=>lastIdx+1+i));
+      // Build OF groups on same machine+slot
+      const ofMapR={};
+      rows.forEach(r=>{
+        if(r.machine!==machine||r.slot!==slot) return;
+        if(r.of_number===of_number&&r.client===client&&r.designation===designation) return;
+        const k=r.of_number+'§'+r.client+'§'+r.designation;
+        if(!ofMapR[k]) ofMapR[k]={rows:[],minIdx:Infinity,maxIdx:-1};
+        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+        ofMapR[k].rows.push(r); ofMapR[k].minIdx=Math.min(ofMapR[k].minIdx,ri); ofMapR[k].maxIdx=Math.max(ofMapR[k].maxIdx,ri);
+      });
+      const sortedGroupsR=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
+
+      // Cascade push: only groups that collide with new slots, then stop at gap
+      const toShiftRows=[];
+      let pushEndR=lastIdx+extra+1;
+      for(const grp of sortedGroupsR){
+        if(grp.minIdx>=pushEndR) break; // gap — stop
+        if(grp.maxIdx<=lastIdx) continue; // entirely before new slots
+        grp.rows.forEach(r=>toShiftRows.push(r));
+        pushEndR=Math.max(pushEndR, grp.maxIdx+extra+1);
+      }
+
+      const shiftMoves=toShiftRows.map(r=>{
+        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+        if(ri<=lastIdx) return null; // don't move parts before extension
+        const ni=ri+extra;
+        return {r, nc: ni<subCols.length ? subCols[ni] : null};
+      }).filter(m=>m&&m.nc!==null);
+      const toShift=toShiftRows;
+
+      // ATOMIC: delete all shifted rows, reinsert at new positions, then add new OF slots
+      const actualInserted=[];
+      if(toShiftRows.length>0){
+        const ids=toShiftRows.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      }
+      for(const {r,nc} of shiftMoves){
+        const {id,...rest}=r;
+        const res=await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=representation'});
+        if(res&&res[0]) actualInserted.push(res[0]);
+      }
+      for(const nc of addSlots){
+        const res=await sb('planning',{method:'POST',
+          body:JSON.stringify({machine,date:nc.date,half_day:nc.hd,slot,
+            of_number,client,designation,mac:last.mac,qte:last.qte,
+            depart:last.depart,conducteur:last.conducteur,bold:last.bold}),
+          prefer:'return=representation'});
+        if(res&&res[0]) actualInserted.push(res[0]);
+      }
+
+      const nPushed=new Set(toShiftRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation)).size;
+      pushHistory('Redimensionnement '+of_number, {deleted:toShiftRows, inserted:actualInserted});
+      showToast('✓ Étendu à '+newHalfDays/2+' éq'+(nPushed?' · '+nPushed+' OF repoussé(s)':'') +' · Ctrl+Z pour annuler');
+      setModal(null);loadPlanning();
+    }catch(e){showToast('Erreur resize: '+e.message);}
+  }
+
+  // Saturday config
+  async function saveSatConfig(date, machines){
+    const prevMachines=satConfigs[date]||[];
+    const newlyAdded=machines.filter(m=>!prevMachines.includes(m));
+    const newlyRemoved=prevMachines.filter(m=>!machines.includes(m));
+
+    setSatModal(null);
+
+    try{
+      await sb('saturday_config?date=eq.'+encodeURIComponent(date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
+      if(machines.length>0)
+        await sb('saturday_config',{method:'POST',body:JSON.stringify({date,machines}),prefer:'return=minimal'});
+
+      busyRef.current=true;
+      const satD=pd(date);
+      const monD=new Date(satD);monD.setDate(satD.getDate()+2);
+      const monDate=fd(monD);
+
+      // Build extended subCols including Saturday slots
+      // This is the full sequence: ...FriM, FriPM, SatM, SatPM, MonM, MonPM...
+      function buildExtSubCols(withSat){
+        // withSat: boolean - include Saturday date?
+        const allDates=new Set(dates);
+        if(withSat) allDates.add(date);
+        else allDates.delete(date); // dates contient déjà le Sam s'il était ouvert — le supprimer explicitement
+        const sorted=[...allDates].sort((a,b)=>pd(a)-pd(b));
+        const cols=[];
+        sorted.forEach(d=>{ cols.push({date:d,hd:1}); cols.push({date:d,hd:2}); });
+        return cols;
+      }
+
+      // OPEN: slots shift from "subCols without Sat" positions to "subCols with Sat" positions
+      // Each slot at monDate+ moves back by 2 (Saturday takes slots 0,1; Monday shifts to 2,3...)
+      // = each row's index in the WITH-SAT sequence = its index in WITHOUT-SAT sequence + 2
+      // So: new position = current position - 2 in the WITH-SAT sequence
+      // Equivalently: row at monDate/hd:1 → satDate/hd:1, monDate/hd:2 → satDate/hd:2,
+      //               nextDate/hd:1 → monDate/hd:1, etc.
+      // Simple: each row shifts by -2 in the extended subcols
+
+      for(const machine of newlyAdded){
+        const extCols=buildExtSubCols(true);
+        const toShift=rows.filter(r=>{
+          if(r.machine!==machine) return false;
+          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          const monI=extCols.findIndex(c=>c.date===monDate&&c.hd===1);
+          return ri>=monI;
+        }).sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+
+        if(toShift.length===0) continue;
+
+        // Delete all first
+        for(const r of toShift)
+          await sb('planning?id=eq.'+r.id,{method:'DELETE',prefer:'return=minimal'});
+
+        // Reinsert each shifted by -2 in extCols
+        for(const r of toShift){
+          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          const ni=ri-2;
+          if(ni>=0){
+            const nc=extCols[ni];
+            const {id,...rest}=r;
+            await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=minimal'});
+          }
+        }
+      }
+
+      // CLOSE: each slot shifts by +2
+      // Row at satDate/hd:1 → monDate/hd:1, satDate/hd:2 → monDate/hd:2,
+      // monDate/hd:1 → nextDate/hd:1, etc.
+      for(const machine of newlyRemoved){
+        const extCols=buildExtSubCols(true); // still has Saturday in it
+        const satI=extCols.findIndex(c=>c.date===date&&c.hd===1);
+        const toShift=rows.filter(r=>{
+          if(r.machine!==machine) return false;
+          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          return ri>=satI;
+        }).sort((a,b)=>pd(b.date)-pd(a.date)||(b.half_day||1)-(a.half_day||1)); // reverse order
+
+        if(toShift.length===0) continue;
+
+        // Delete all first (reverse order to avoid conflicts)
+        for(const r of toShift)
+          await sb('planning?id=eq.'+r.id,{method:'DELETE',prefer:'return=minimal'});
+
+        // Reinsert at same index in extColsNoSat (Saturday removed → Mon shifts to satI)
+        // SatM(satI in extCols) → extColsNoSat[satI] = MonM ✓
+        // MonM(satI+2 in extCols) → extColsNoSat[satI+2] = TueM ✓ (gap preserved)
+        const extColsNoSat=buildExtSubCols(false);
+        for(const r of [...toShift].reverse()){
+          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          const ni=ri; // same index, Saturday slots just disappear
+          if(ni>=0&&ni<extColsNoSat.length){
+            const nc=extColsNoSat[ni];
+            const {id,...rest}=r;
+            await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=minimal'});
+          }
+        }
+      }
+
+    }catch(e){showToast('Erreur samedi: '+e.message);}
+    finally{
+      busyRef.current=false;
+      setSatConfigs(s=>({...s,[date]:machines}));
+      load();
+    }
+  }
+  // Helper: get next saturday after a friday date
+  function nextSaturday(fridayStr){
+    var d=pd(fridayStr);d.setDate(d.getDate()+1);return fd(d);
+  }
+
+  // Toggle regime for machine+date
+  async function toggleRegime(machine, date){
+    const cur=getRegime(regimes,machine,date);
+    const next=cur==='1x8'?'2x8':'1x8';
+
+    // Optimistic UI update immédiat
+    setRegimes(r=>({...r,[machine+'|'+date]:next}));
+
+    // Upsert régime en DB
+    try{
+      await sb('machine_regime?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
+        {method:'DELETE',prefer:'return=minimal'});
+    }catch(e){}
+    await sb('machine_regime',{method:'POST',body:JSON.stringify({machine,date,mode:next}),prefer:'return=minimal'});
+
+    const dayRows=rows.filter(r=>r.machine===machine&&r.date===date);
+    if(dayRows.length===0){ loadPlanning(); return; }
+
+    busyRef.current=true;
+    try{
+      const ofKeys=[...new Set(dayRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation+'§'+r.slot))];
+      const newRegimes={...regimes,[machine+'|'+date]:next};
+      const allToDelete=[];
+      const allToInsert=[];
+
+      for(const k of ofKeys){
+        const [ofn,cli,des,sl]=k.split('§');
+        const slot=parseInt(sl);
+        const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===ofn&&r.client===cli&&r.designation===des)
+          .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+        const oldDur=ofR.length;
+        const totalEq=ofR.reduce((sum,r)=>{
+          const m=getRegime(regimes,machine,r.date);
+          return sum+(m==='2x8'?1:0.5);
+        },0);
+        const startIdx=subColsMap.get(ofR[0].date+'|'+(ofR[0].half_day||1));
+        let eq=0,newDur=0;
+        for(let i=startIdx;i<subCols.length&&eq<totalEq;i++){
+          eq+=((newRegimes[machine+'|'+subCols[i].date])||'1x8')==='2x8'?1:0.5;
+          newDur++;
+        }
+        if(newDur===oldDur) continue;
+
+        if(next==='2x8'){
+          const freed=oldDur-newDur;
+          const oldLastIdx=subColsMap.get(ofR[ofR.length-1].date+'|'+(ofR[ofR.length-1].half_day||1));
+          const slotAfterOld=oldLastIdx+1;
+          ofR.slice(newDur).forEach(r=>allToDelete.push(r));
+          const adjacentRows=rows.filter(r=>{
+            if(r.machine!==machine||r.slot!==slot) return false;
+            if(r.of_number===ofn&&r.client===cli&&r.designation===des) return false;
+            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+            return ri>=slotAfterOld;
+          });
+          const isAdjacent=adjacentRows.some(r=>{
+            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+            return ri===slotAfterOld;
+          });
+          if(isAdjacent&&freed>0){
+            const ofMapPull={};
+            adjacentRows.forEach(r=>{
+              const rk=r.of_number+'§'+r.client+'§'+r.designation;
+              if(!ofMapPull[rk]) ofMapPull[rk]={rows:[],minIdx:Infinity};
+              const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+              ofMapPull[rk].rows.push({r,ri});
+              if(ri<ofMapPull[rk].minIdx) ofMapPull[rk].minIdx=ri;
+            });
+            const sorted=Object.values(ofMapPull).sort((a,b)=>a.minIdx-b.minIdx);
+            let pullEnd=slotAfterOld;
+            const toPull=[];
+            for(const grp of sorted){
+              if(grp.minIdx>pullEnd) break;
+              toPull.push(...grp.rows);
+              pullEnd=Math.max(pullEnd,...grp.rows.map(x=>x.ri+1));
+            }
+            toPull.forEach(({r})=>allToDelete.push(r));
+            toPull.forEach(({r,ri})=>{
+              const ni=ri-freed;
+              if(ni>=0&&ni<subCols.length){
+                const nc=subCols[ni];
+                const {id,...rest}=r;
+                allToInsert.push({...rest,date:nc.date,half_day:nc.hd});
+              }
+            });
+          }
+        } else {
+          // Grow
+          const last=ofR[ofR.length-1];
+          const lastIdx=subColsMap.get(last.date+'|'+(last.half_day||1));
+          const extra=newDur-oldDur;
+          const addSlots=[];
+          for(let i=1;i<=extra;i++){const ni=lastIdx+i;if(ni<subCols.length)addSlots.push(subCols[ni]);}
+          const ofMapR={};
+          rows.forEach(r=>{
+            if(r.machine!==machine||r.slot!==slot) return;
+            if(r.of_number===ofn&&r.client===cli&&r.designation===des) return;
+            const k2=r.of_number+'§'+r.client+'§'+r.designation;
+            if(!ofMapR[k2]) ofMapR[k2]={rows:[],minIdx:Infinity,maxIdx:-1};
+            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+            ofMapR[k2].rows.push(r);ofMapR[k2].minIdx=Math.min(ofMapR[k2].minIdx,ri);ofMapR[k2].maxIdx=Math.max(ofMapR[k2].maxIdx,ri);
+          });
+          const sortedG=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
+          const toShiftRows=[];
+          let pushEndR=lastIdx+extra+1;
+          for(const grp of sortedG){
+            if(grp.minIdx>=pushEndR) break;
+            if(grp.maxIdx<=lastIdx) continue;
+            grp.rows.forEach(r=>toShiftRows.push(r));
+            pushEndR=Math.max(pushEndR,grp.maxIdx+extra+1);
+          }
+          toShiftRows.forEach(r=>allToDelete.push(r));
+          toShiftRows.forEach(r=>{
+            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
+            if(ri<=lastIdx) return;
+            const ni=ri+extra;
+            if(ni<subCols.length){const nc=subCols[ni];const {id,...rest}=r;allToInsert.push({...rest,date:nc.date,half_day:nc.hd});}
+          });
+          addSlots.forEach(nc=>{const {id,...rest}=last;allToInsert.push({...rest,date:nc.date,half_day:nc.hd});});
+        }
+      }
+
+      // BULK DELETE
+      if(allToDelete.length>0){
+        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      }
+      // BULK INSERT
+      if(allToInsert.length>0){
+        await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=minimal'});
+      }
+
+    }finally{busyRef.current=false;}
+    loadPlanning();
+  }
+  window._regimes=regimes; // expose for EditModal
+  const today=fd(new Date());
+  const base={machine:'PFC',date:today,half_day:1,slot:1,of_number:'',client:'',designation:'',mac:'',qte:'',format:'',depart:'',conducteur:'',bold:false};
+
+  if(loading)return(
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',gap:12,color:'#888',fontFamily:'IBM Plex Mono,monospace'}}>
+      <div style={{width:20,height:20,borderRadius:'50%',border:'2px solid #ddd',borderTopColor:'#c9a84c',animation:'spin .7s linear infinite'}}/>
+      Chargement…
+    </div>
+  );
+
+  const nSC=filteredSubCols.length;
+  // grid: label col + 2 sub-cols per day
+  const gTC=LW+'px repeat('+nSC+', '+hdw+'px)';
+  const gTR=WKH+'px '+HDR+'px '+MACHINES.map(()=>RGH+'px '+RH+'px').join(' ');
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden'}}>
+      {/* HEADER */}
+      <div style={{display:'flex',alignItems:'center',gap:14,padding:'9px 20px',background:'#1a1916',borderBottom:'3px solid #c9a84c',flexShrink:0}}>
+        <div>
+          <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:10,fontWeight:600,color:'#c9a84c',letterSpacing:3}}>PDD · PYRÉNÉES DORURE DÉCOUPE</div>
+          <div style={{fontSize:14,fontWeight:700,color:'#f5f4f0',marginTop:2}}>Planning Production</div>
+        </div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,fontSize:11,color:'#aaa'}}>
+          <div style={{width:7,height:7,borderRadius:'50%',background:'#4faa7a',animation:'pulse 2s infinite'}}/>
+          {rows.length} entrées · auto-sync
+          {sat&&<span style={{background:'#0d3030',color:'#7dd',padding:'2px 8px',borderRadius:10,fontSize:10}}>Sam. ouvert</span>}
+          <button onClick={()=>setShowSet(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>⚙ Paramètres</button>
+          <button onClick={()=>setShowClients(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>👥 Clients</button>
+        </div>
+      </div>
+
+      {/* TOOLBAR */}
+      <div style={{display:'flex',alignItems:'center',gap:10,padding:'7px 20px',background:'#fff',borderBottom:'1px solid #ddd',flexShrink:0}}>
+        <input style={{padding:'6px 10px',borderRadius:5,border:'1px solid #ddd',background:'#f5f5f0',fontSize:12,width:200,fontFamily:'IBM Plex Sans,sans-serif'}}
+          placeholder="🔍  Client, OF, désignation…" value={q} onChange={e=>setQ(e.target.value)}/>
+        <div style={{width:1,height:22,background:'#ddd'}}/>
+        <button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>
+        <button onClick={()=>{
+          const todayIdx=filteredDates.indexOf(today);
+          if(todayIdx>=0&&gridRef.current)
+            gridRef.current.scrollLeft=Math.max(0,LW+(todayIdx*2-5)*hdw-80);
+        }} title="Recentrer sur aujourd'hui" style={{
+          padding:'6px 13px',borderRadius:5,border:'1px solid #b8b5aa',
+          background:'#fff',color:'#555',fontSize:12,fontWeight:600,
+          cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',transition:'all .15s'
+        }}
+          onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';}}
+          onMouseLeave={e=>{e.currentTarget.style.background='#fff';}}
+        >📅 Aujourd'hui</button>
+        <button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
+          display:'flex',alignItems:'center',gap:6,
+          padding:'6px 13px',borderRadius:5,
+          border:'1px solid #b8b5aa',background:'#fff',
+          color:'#555',fontSize:12,fontWeight:600,cursor:'pointer',
+          fontFamily:'IBM Plex Sans,sans-serif',transition:'all .15s'
+        }}
+          onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';e.currentTarget.style.color='#1a1916';}}
+          onMouseLeave={e=>{e.currentTarget.style.background='#fff';e.currentTarget.style.color='#555';}}
+        >
+          <span style={{fontSize:16,lineHeight:1}}>↩</span> Annuler
+        </button>
+        <div style={{display:'flex',alignItems:'center',gap:2,border:'1px solid #b8b5aa',borderRadius:5,overflow:'hidden'}}>
+          <button onClick={zoomOut} title="Zoom arrière" style={{
+            padding:'6px 10px',border:'none',background:'#fff',
+            color:'#555',fontSize:14,cursor:hdw<=24?'not-allowed':'pointer',
+            fontFamily:'IBM Plex Sans,sans-serif',opacity:hdw<=24?.4:1,lineHeight:1
+          }}>🔍−</button>
+          <span style={{fontSize:11,color:'#888',padding:'0 6px',borderLeft:'1px solid #e0e0d8',borderRight:'1px solid #e0e0d8',userSelect:'none',lineHeight:'28px'}}>
+            {Math.round(hdw/50*100)}%
+          </span>
+          <button onClick={zoomIn} title="Zoom avant" style={{
+            padding:'6px 10px',border:'none',background:'#fff',
+            color:'#555',fontSize:14,cursor:hdw>=120?'not-allowed':'pointer',
+            fontFamily:'IBM Plex Sans,sans-serif',opacity:hdw>=120?.4:1,lineHeight:1
+          }}>🔍+</button>
+        </div>
+        <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:12,fontSize:11,color:'#888'}}>
+          <span style={{display:'flex',alignItems:'center',gap:5}}>
+            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#d0f0cc',boxShadow:'inset 3px 0 0 #2d6a4f'}}/>Reçu</span>
+          <span style={{display:'flex',alignItems:'center',gap:5}}>
+            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#dce8ff',boxShadow:'inset 3px 0 0 #bbb'}}/>En attente</span>
+          <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e67e22'}}/> Départ dans ≤2j ouvrés</span>
+          <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e8001a'}}/> Départ dépassé</span>
+          <span style={{fontSize:10,color:'#bbb'}}>Glisser = déplacer · Cliquer = éditer</span>
+        </div>
+      </div>
+
+      {/* GRID */}
+      <div ref={gridRef} style={{flex:1,overflow:'auto',background:'#f0f0ec',cursor:resizeSrc?'ew-resize':'default'}}>
+        <div style={{display:'grid',gridTemplateColumns:gTC,gridTemplateRows:gTR,minWidth:LW+nSC*hdw,position:'relative'}}>
+
+          {/* LIGNE AUJOURD'HUI — traverse toutes les lignes */}
+          {(()=>{
+            const todayIdx=filteredDates.indexOf(today);
+            if(todayIdx<0) return null;
+            const left=LW+todayIdx*2*hdw;
+            const totalRows=2+MACHINES.length*2;
+            return(
+              <div style={{
+                position:'absolute',top:0,bottom:0,
+                left:left,width:hdw*2,
+                background:'rgba(255,215,0,0.06)',
+                pointerEvents:'none',zIndex:0,
+              }}/>
+            );
+          })()}
+
+          {/* CORNER */}
+          <div style={{gridRow:'1/3',gridColumn:1,position:'sticky',top:0,left:0,zIndex:30,
+            background:'#000',borderRight:'2px solid #c9a84c',borderBottom:'3px solid #c9a84c',
+            padding:'8px 10px',display:'flex',alignItems:'flex-end',
+            fontFamily:'IBM Plex Mono,monospace',fontSize:10,fontWeight:600,color:'#c9a84c',letterSpacing:1}}>
+            MACHINE
+          </div>
+
+          {/* WEEK BANDEAUX — row 1 */}
+          {(()=>{
+            const weeks=[];let cur=null;
+            filteredDates.forEach((date,di)=>{
+              const d=pd(date),wk=getISOWeek(d),yr=d.getFullYear(),key=yr+'W'+wk;
+              if(!cur||cur.key!==key){if(cur)weeks.push(cur);cur={key,wk,si:di,ei:di,par:wk%2};}
+              else cur.ei=di;
+            });
+            if(cur)weeks.push(cur);
+            return weeks.map(w=>{
+              const cs=2+w.si*2,ce=2+w.ei*2+2;
+              const bg=w.par===0?'#a8c8e8':'#a8dab8';
+              return(
+                <div key={w.key} style={{
+                  gridRow:1,gridColumn:cs+'/'+ce,
+                  position:'sticky',top:0,zIndex:11,
+                  background:bg,
+                  borderBottom:'1px solid #2a2a2a',
+                  borderRight:'1px solid #2a2a2a',
+                  display:'flex',alignItems:'center',justifyContent:'center',
+                }}>
+                  <span style={{fontSize:9,fontWeight:700,fontFamily:'IBM Plex Mono,monospace',color:'#2a2a1a',letterSpacing:1}}>
+                    S{w.wk}
+                  </span>
+                </div>
+              );
+            });
+          })()}
+
+          {/* DATE HEADERS — row 2, each spans 2 sub-cols */}
+          {filteredDates.map((date,di)=>{
+            const d=pd(date),dow=d.getDay(),isT=date===today;
+            const isSat=dow===6;
+            const wk=getISOWeek(d),par=wk%2;
+            // Alternate week colors (preserving today/sat highlights)
+            const wkBg=par===0?'#c8dff5':'#c8efd4';
+            const bg=isT?'#2a1e00':isSat?'#081828':wkBg;
+            const nc=isT?'#ffd050':isSat?'#7be':'#1a1916';
+            const sc=isT?'#b89030':isSat?'#5aa':'#4a4a40';
+            const colStart=2+di*2;
+            const prevDate=filteredDates[di-1];
+            const prevDow=prevDate?pd(prevDate).getDay():-1;
+            const prevSatDate=prevDate?(()=>{var d2=pd(prevDate);d2.setDate(d2.getDate()+1);return fd(d2);})():null;
+            const satMachines=satConfigs[date]||[];
+            return(<React.Fragment key={date}>
+              {(()=>{
+                const showBetween=prevDow===5&&dow!==6&&prevSatDate;
+                const showOnSat=isSat&&satMachines.length>0;
+                if(!showBetween&&!showOnSat) return null;
+                const btnDate=showOnSat?date:prevSatDate;
+                const satOpen=(satConfigs[btnDate]||[]).length>0;
+                return(
+                  <div style={{
+                    gridRow:2,
+                    gridColumn:showOnSat?(colStart+1)+'/'+(colStart+2):(colStart-1)+'/'+colStart,
+                    position:'sticky',top:WKH,zIndex:20,
+                    display:'flex',alignItems:'center',
+                    justifyContent:showOnSat?'flex-end':'flex-end',
+                    pointerEvents:'none',
+                  }}>
+                    <div onClick={()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
+                      title={satOpen?'Modifier/fermer ce samedi':'Ouvrir ce samedi'}
+                      style={{
+                        width:16,height:16,borderRadius:'50%',cursor:'pointer',
+                        background:satOpen?'#c0392b':'#8a6a20',
+                        color:'#fff',fontSize:13,fontWeight:900,
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        lineHeight:1,userSelect:'none',pointerEvents:'all',
+                        boxShadow:'0 1px 4px rgba(0,0,0,.6)',
+                        transform:showOnSat?'translateX(-4px)':'translateX(8px)',
+                        border:'1.5px solid rgba(255,255,255,.3)',
+                      }}>{satOpen?'−':'+'}</div>
+                  </div>
+                );
+              })()}
+              <div style={{
+                gridRow:2,gridColumn:colStart+'/'+(colStart+2),
+                position:'sticky',top:WKH,zIndex:10,
+                background:bg,
+                borderBottom:'3px solid #c9a84c',
+                borderRight:'2px solid #3a3a3a',
+                textAlign:'center',padding:'4px 2px 3px',userSelect:'none'
+              }}>
+                <div style={{fontSize:11,color:sc,fontFamily:'IBM Plex Mono,monospace',fontWeight:600,letterSpacing:.3}}>{DAY[dow]}</div>
+                <div style={{fontSize:20,fontWeight:700,color:nc,lineHeight:1.05}}>{d.getDate()}</div>
+                <div style={{fontSize:10,color:sc,fontWeight:600}}>{MON[d.getMonth()]}</div>
+              </div>
+              {isSat&&(satConfigs[date]||[]).length>0&&(
+                <div style={{gridRow:2,gridColumn:(di*2+2)+'/'+(di*2+4),
+                  display:'flex',alignItems:'flex-end',justifyContent:'flex-end',
+                  pointerEvents:'none',position:'relative'}}>
+                  <button onClick={()=>setSatModal({date,machines:satConfigs[date]||[]})}
+                    style={{pointerEvents:'all',position:'absolute',top:4,right:4,
+                      padding:'1px 6px',fontSize:9,borderRadius:3,border:'1px solid #aaa',
+                      background:'rgba(255,255,255,.8)',cursor:'pointer',color:'#555'}}>✏</button>
+                </div>
+              )}
+            </React.Fragment>);
+          })}
+
+          {/* Sub-header row (M/AM labels) — sticky just below date header */}
+          {/* We embed M/AM in the half-day cells as tiny labels instead */}
+
+          {/* MACHINE ROWS */}
+          {MACHINES.map((machine,mi)=>{
+            const rReg=3+mi*2, r1=4+mi*2;
+            const dMode=getModeForDate(sets,machine,today);
+            const b1=bandsPerMachine[machine]||[];
+            const mc=MACHINE_COLORS[machine]||{bg:'#fff',text:'#1a1916'};
+
+            const used1=new Set(b1.flatMap(b=>b.special?[b.i]:Array.from({length:b.ei-b.si+1},(_,k)=>b.si+k)));
+
+            return(
+              <React.Fragment key={machine}>
+                {/* LABEL spans both rows */}
+                <div style={{
+                  gridRow:rReg+'/'+(r1+1),gridColumn:1,
+                  position:'sticky',left:0,zIndex:5,
+                  background:mc.bg,borderRight:'2px solid #b8b5aa',borderBottom:'2px solid #ccc',
+                  padding:'0 10px',display:'flex',flexDirection:'column',justifyContent:'center',
+                  height:RGH+RH
+                }}>
+                  <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,fontWeight:700,color:mc.text}}>{machine}</div>
+                </div>
+
+                {/* REGIME ROW — one cell per day */}
+                {filteredDates.map((date,di)=>{
+                  const mode=getRegime(regimes,machine,date);
+                  const is2x8=mode==='2x8';
+                  const isSatOpen=isSaturdayDate(date)&&(satConfigs[date]||[]).includes(machine);
+                  const isSat=isSaturdayDate(date);
+                  const colStart=2+di*2;
+                  return(
+                    <div key={'reg'+date}
+                      style={{
+                        gridRow:rReg, gridColumn:colStart+'/'+(colStart+2),
+                        background:isSatOpen?'#fff3c0':is2x8?'#d4eaff':'transparent',
+                        borderBottom:isSatOpen?'1px solid #e0c040':is2x8?'1px solid #90c4f0':'1px solid #e8e8e0',
+                        borderRight:'1px solid #e0e0d8',
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        cursor:isSat?'default':'pointer',userSelect:'none',
+                        transition:'background .15s',
+                      }}
+                      onClick={isSat?undefined:()=>toggleRegime(machine,date)}
+                      title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}
+                    >
+                      <span style={{
+                        fontSize:9,fontWeight:700,
+                        fontFamily:'IBM Plex Mono,monospace',
+                        letterSpacing:.5,
+                        color:isSatOpen?'#7a6000':is2x8?'#104070':'#d8d8d0',
+                        fontWeight:isSatOpen?700:400,
+                      }}>{isSatOpen?'Sam':is2x8?'2×8':'1×8'}</span>
+                    </div>
+                  );
+                })}
+
+                {/* Slot 1 bands */}
+                {b1.map((band,bi)=>{
+                  if(band.special){
+                    return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                      <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
+                    </div>;
+                  }
+                  const isDrg=dragSrc&&band.of_number===dragSrc.of_number&&band.client===dragSrc.client&&band.designation===dragSrc.designation;
+                  const isDone=getDone(band.fr);
+                  const color=isDone?'#b0b0b0':ofColorKey(band.fr);
+                  const span=band.ei-band.si+1;
+                  const k=machine+'|'+band.rows[0].date+'|'+(band.rows[0].half_day||1)+'|1';
+                  return(
+                    <div key={'b1'+bi} style={{
+                      gridRow:r1,gridColumn:(band.si+2)+'/'+(band.ei+3),
+                      background:color,opacity:isDrg?.4:1,
+                      borderBottom:'1px solid rgba(0,0,0,.07)',
+                      borderRight:span>1?'1px solid rgba(0,0,0,.08)':'1px solid rgba(0,0,0,.08)',
+                      borderRadius:'4px 4px 0 0',
+                      padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
+                      cursor:'grab',
+                      boxShadow:(!isDone&&band.bold)?'inset 4px 0 0 #2d6a4f':'inset 4px 0 0 rgba(0,0,0,.15)',
+                      zIndex:1,
+                    }}
+                      draggable={!resizeSrc} onDragStart={e=>onDS(e,band.fr)}
+                      onDragOver={e=>onDO(e,k)} onDragLeave={onDL}
+                      onDrop={e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
+                      onClick={()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
+                      title={[
+                        'OF : '+(band.of_number||'—'),
+                        band.designation||'',
+                        band.fr.mac?'MAC : '+band.fr.mac:'',
+                        [band.fr.format, band.depart?(()=>{const p=band.depart.split('/');return p.length>=2?p[0]+'/'+p[1]:band.depart;})():null].filter(Boolean).join(' - '),
+                        getObs(band.fr)?'Obs : '+getObs(band.fr):'',
+                      ].filter(Boolean).join('\n')}
+                    >
+                      {(()=>{const lastRow=band.rows[band.rows.length-1];const dc=isDone?null:getDeadlineColor(band.depart,lastRow.date,sat);return dc&&<div style={{position:'absolute',top:0,right:0,width:dc==='#e8001a'?8:4,height:'100%',background:dc,borderRadius:'0 4px 4px 0'}}/>})()}
+                      {(()=>{const tc=contrastColor(color);return(<>
+                        <div style={{fontSize:14,fontWeight:700,color:tc,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.25}}>{band.client}</div>
+                        {band.designation&&<div style={{fontSize:13,color:tc,opacity:.75,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.2}}>{band.designation}</div>}
+                        {band.fr.qte&&<div style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{band.fr.qte}</div>}
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-end',marginTop:1,paddingRight:10}}>
+                          {band.fr.format?<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap'}}>{band.fr.format}</span>:<span/>}
+                          {band.depart&&<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap',marginLeft:'auto'}}>
+                            {(()=>{const p=band.depart.split('/');return p.length>=2?p[0]+'/'+p[1]:band.depart;})()}
+                          </span>}
+                        </div>
+                      </>);})()}
+                      {dragOver===k&&<div style={{position:'absolute',inset:0,border:'2px solid #8a6a20',borderRadius:'inherit',pointerEvents:'none'}}/>}
+                      {/* Resize handle — right edge */}
+                      <div onMouseDown={e=>onResizeStart(e,band,1,machine)}
+                        style={{position:'absolute',top:0,right:0,width:6,height:'100%',cursor:'ew-resize',zIndex:4,
+                          background:'rgba(0,0,0,.0)'}}
+                        onClick={e=>e.stopPropagation()}/>
+                      {/* Resize preview overlay */}
+                      {resizeSrc&&resizeSrc.band.of_number===band.of_number&&resizeSrc.band.client===band.client&&resizeSrc.band.designation===band.designation&&resizeSrc.slot===1&&resizeSrc.machine===machine&&(
+                        <div style={{position:'absolute',inset:0,pointerEvents:'none',
+                          background:'rgba(255,255,255,.35)',
+                          outline:'2px dashed #8a6a20',outlineOffset:'-2px',borderRadius:'inherit',
+                          display:'flex',alignItems:'center',justifyContent:'center'}}>
+                          <span style={{fontSize:13,fontWeight:700,color:'#1a1916',fontFamily:'IBM Plex Mono,monospace',
+                            background:'rgba(255,255,255,.85)',padding:'2px 8px',borderRadius:4,boxShadow:'0 1px 4px rgba(0,0,0,.2)'}}>
+                            {(()=>{
+                              const firstRow=resizeSrc.band.rows[0];
+                              const startIdx=subColsMap.get(firstRow.date+'|'+(firstRow.half_day||1));
+                              let eq=0;
+                              for(let i=0;i<resizeSrc.curDur;i++){
+                                const sc=subCols[startIdx+i];
+                                if(!sc) break;
+                                const m=getRegime(regimes,resizeSrc.machine,sc.date);
+                                eq+=(m==='2x8'?1:0.5);
+                              }
+                              return eq;
+                            })()} éq
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* Slot 1 empties */}
+                {filteredSubCols.map(({date,hd},sci)=>{
+                  if(used1.has(sci))return null;
+                  const k=machine+'|'+date+'|'+hd+'|1';
+                  const isM=hd===1;
+                  return(
+                    <div key={'e1'+sci} style={{
+                      gridRow:r1,gridColumn:sci+2,
+                      background:dragOver===k?'#edf5e0':date===today?'rgba(255,215,0,0.06)':isM?'#fafaf8':'#f5f5f2',
+                      borderBottom:'1px solid rgba(0,0,0,.04)',
+                      borderRight:isM?'none':'1px solid #dddbd3',
+                      cursor:'pointer',position:'relative'
+                    }}
+                      onDragOver={e=>onDO(e,k)} onDragLeave={onDL}
+                      onDrop={e=>onDrop(e,machine,date,hd,1)}
+                      onClick={()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
+                    />
+                  );
+                })}
+
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+
+      {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={rows} subCols={subCols} dates={dates} sets={sets} sat={sat} clients={clients}/>}
+      {showSet&&<Settings sets={sets} onChange={upd} onClose={()=>setShowSet(false)}/>}
+      {showClients&&<ClientsManager onClose={()=>{setShowClients(false);load();}}/>}
+      {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
+        onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
+      {toast&&<div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dates,sets,sat,clients}){
+  const isEdit=modal.type==='edit';
+  const [f,setF]=useState({...modal.data});
+  const [hdCount,setHdCount]=useState(2); // half-days, default 1j
+
+  // Calculs régime et durée AVANT newDur useState
+  const regimeKey=(window._regimes&&window._regimes[modal.data.machine+'|'+modal.data.date]);
+  const mode0=regimeKey||'1x8';
+  const ofRowsInit=isEdit?(rows||[]).filter(r=>r.machine===modal.data.machine&&r.slot===modal.data.slot&&r.of_number===modal.data.of_number&&r.client===modal.data.client&&r.designation===modal.data.designation):[];
+  const curEqInit=ofRowsInit.reduce((sum,r)=>{
+    const m=(window._regimes&&window._regimes[r.machine+'|'+r.date])||'1x8';
+    return sum+(m==='2x8'?1:0.5);
+  },0);
+  const eqF0=mode0==='2x8'?1:2;
+  // newDur initialisé en demi-j correspondant à curEq dans le mode du premier slot
+  const [newDur,setNewDur]=useState(()=>{
+    if(!isEdit) return 2;
+    return Math.max(1, Math.round(curEqInit) * eqF0);
+  });
+  // Color: auto from designation (fallback client), with manual override
+  const autoColor=hc((f.designation||f.client||''));
+  const s=(k,v)=>setF(x=>({...x,[k]:v}));
+  const [clientSugg,setClientSugg]=useState([]);
+  const [showSugg,setShowSugg]=useState(false);
+  function onClientChange(val){
+    s('client',val);
+    if(val.length>=1){
+      const q=val.toLowerCase();
+      setClientSugg((clients||[]).filter(c=>c.toLowerCase().includes(q)).slice(0,8));
+      setShowSugg(true);
+    } else {
+      setShowSugg(false);
+    }
+  }
+  // Extract existing color override from conducteur field
+  const existingColor=(()=>{
+    const c=modal.data.conducteur||'';
+    if(c.startsWith('COLOR:')){const m=c.match(/^COLOR:(#[0-9a-fA-F]{6})/);if(m)return m[1];}
+    return null;
+  })();
+  const [colorOverride,setColorOverride]=useState(existingColor);
+  const [showPalette,setShowPalette]=useState(false);
+  const displayColor=colorOverride||autoColor;
+  const mode=mode0;
+  const hpd=hphd(mode==='2x8'?'2x8':'journee');
+  const ofRows=ofRowsInit;
+  const curDuration=ofRows.length;
+  const curEq=curEqInit;
+
+  // Convert dd/mm/yy to yyyy-mm-dd for input[type=date] and back
+  function toInputDate(s){if(!s)return'';const p=s.split('/');if(p.length!==3)return'';return`20${p[2]}-${p[1]}-${p[0]}`;}
+  function fromInputDate(s){if(!s)return'';const p=s.split('-');return`${p[2]}/${p[1]}/${p[2]?p[0].slice(2):''}`;}
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',borderRadius:10,padding:24,width:500,maxWidth:'95vw',maxHeight:'92vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.25)'}}>
+        <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#8a6a20',letterSpacing:1,marginBottom:20,textTransform:'uppercase'}}>
+          {isEdit?'✏ Modifier l\'OF':'+ Nouvel OF'}
+        </div>
+
+        {/* Info contextuelle (non modifiable en création car définie par le clic) */}
+        <div style={{background:'#f5f5f0',borderRadius:6,padding:'8px 12px',marginBottom:14,fontSize:11,color:'#666',display:'flex',gap:16,flexWrap:'wrap'}}>
+          <span>🔧 <strong>{f.machine}</strong></span>
+          <span>📅 <strong>{f.date}</strong> · {f.half_day===1?'Matin':'PM'}</span>
+
+        </div>
+
+        <div className="frow"><label className="lbl">N° OF</label>
+          <input className="inp" value={f.of_number} onChange={e=>s('of_number',e.target.value)} placeholder="2603000001"/>
+        </div>
+
+        <div className="frow" style={{position:'relative'}}><label className="lbl">Client</label>
+          <input className="inp" value={f.client}
+            onChange={e=>onClientChange(e.target.value)}
+            onFocus={()=>{if(f.client.length>=1)setShowSugg(true);}}
+            onBlur={()=>setTimeout(()=>setShowSugg(false),150)}
+            placeholder="PUSTERLA" autoComplete="off"/>
+          {showSugg&&clientSugg.length>0&&(
+            <div style={{position:'absolute',top:'100%',left:0,right:0,background:'#fff',border:'1px solid #ddd',borderRadius:'0 0 6px 6px',boxShadow:'0 4px 12px rgba(0,0,0,.1)',zIndex:200,maxHeight:200,overflowY:'auto'}}>
+              {clientSugg.map(c=>(
+                <div key={c} onMouseDown={()=>{s('client',c);setShowSugg(false);}}
+                  style={{padding:'8px 12px',cursor:'pointer',fontSize:13,borderBottom:'1px solid #f0efe9'}}
+                  onMouseEnter={e=>e.currentTarget.style.background='#f5f3ed'}
+                  onMouseLeave={e=>e.currentTarget.style.background='#fff'}>
+                  {c}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="frow"><label className="lbl">Désignation</label>
+          <input className="inp" value={f.designation} onChange={e=>s('designation',e.target.value)}/>
+        </div>
+
+        <div className="frow" style={{position:'relative'}}>
+          <label className="lbl">Couleur</label>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <div style={{width:28,height:28,borderRadius:4,background:displayColor,border:'2px solid #ccc',cursor:'pointer',flexShrink:0,boxShadow:'0 1px 3px rgba(0,0,0,.2)'}}
+              onClick={()=>setShowPalette(p=>!p)}/>
+            <span style={{fontSize:11,color:'#888'}}>{colorOverride?'Personnalisée':'Auto (désignation)'}</span>
+            {colorOverride&&<button onClick={()=>setColorOverride(null)}
+              style={{fontSize:10,color:'#666',background:'none',border:'none',cursor:'pointer',padding:0}}>↺ Auto</button>}
+          </div>
+          {showPalette&&(
+            <div style={{position:'absolute',top:'calc(100% + 4px)',left:0,zIndex:300,background:'#fff',
+              border:'1px solid #ccc',borderRadius:4,padding:8,boxShadow:'0 4px 16px rgba(0,0,0,.2)'}}>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(10,20px)',gap:2}}>
+                {[
+                  '#000000','#434343','#666666','#999999','#b7b7b7','#cccccc','#d9d9d9','#efefef','#f3f3f3','#ffffff',
+                  '#ff0000','#ff9900','#ffff00','#00ff00','#00ffff','#4a86e8','#0000ff','#9900ff','#ff00ff','#ff4081',
+                  '#e06666','#f6b26b','#ffd966','#93c47d','#76d7ea','#6fa8dc','#8e7cc3','#c27ba0','#e66100','#bf9000',
+                  '#cc0000','#e69138','#f1c232','#6aa84f','#45818e','#3d85c8','#674ea7','#a64d79','#dd7e6b','#8fce00',
+                  '#990000','#b45309','#bf8f00','#38761d','#134f5c','#1155cc','#351c75','#741b47','#783f04','#274e13',
+                  '#f4cccc','#fce5cd','#fff2cc','#d9ead3','#d0e0e3','#c9daf8','#d9d2e9','#ead1dc','#fbefd2','#e2efda',
+                  '#ea9999','#f9cb9c','#ffe599','#b6d7a8','#a2c4c9','#a4c2f4','#b4a7d6','#d5a6bd','#f0c882','#c6e0b4',
+                  '#e06666','#f6b26b','#ffd966','#93c47d','#76d7ea','#6fa8dc','#8e7cc3','#c27ba0','#e8bc5f','#a9d18e',
+                  '#cc0000','#e69138','#f1c232','#6aa84f','#45818e','#3d85c8','#674ea7','#a64d79','#c9760d','#548235',
+                  '#7f0000','#783f04','#7f6000','#274e13','#0c343d','#1c4587','#20124d','#4c1130','#8b4513','#1e4620',
+                ].map(c=>(
+                  <div key={c} onClick={()=>{setColorOverride(c);setShowPalette(false);}}
+                    title={c}
+                    style={{width:20,height:20,background:c,cursor:'pointer',borderRadius:2,
+                      border:colorOverride===c?'2px solid #333':'1px solid rgba(0,0,0,.15)',
+                      transform:colorOverride===c?'scale(1.2)':'scale(1)',
+                      transition:'transform .1s'}}
+                    onMouseEnter={e=>e.currentTarget.style.transform='scale(1.25)'}
+                    onMouseLeave={e=>e.currentTarget.style.transform=colorOverride===c?'scale(1.2)':'scale(1)'}
+                  />
+                ))}
+              </div>
+              <div style={{borderTop:'1px solid #eee',marginTop:8,paddingTop:6}}>
+                <button onClick={()=>{setColorOverride(null);setShowPalette(false);}}
+                  style={{width:'100%',padding:'5px 8px',borderRadius:4,border:'1px solid #ddd',
+                    background:'#f5f5f5',fontSize:11,cursor:'pointer',color:'#555',
+                    fontFamily:'IBM Plex Sans,sans-serif',display:'flex',alignItems:'center',gap:6}}>
+                  <span style={{fontSize:13}}>↺</span> Réinitialiser (couleur auto)
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="g2">
+          <div className="frow"><label className="lbl">MAC</label><input className="inp" value={f.mac} onChange={e=>s('mac',e.target.value)}/></div>
+          <div className="frow"><label className="lbl">Quantité</label><input className="inp" value={f.qte} onChange={e=>s('qte',e.target.value)}/></div>
+        </div>
+
+        <div className="g2">
+          <div className="frow"><label className="lbl">Format</label>
+            <input className="inp" value={f.format||''} onChange={e=>s('format',e.target.value)} placeholder="ex: A4, 210×297"/>
+          </div>
+          <div className="frow"><label className="lbl">Départ prévu</label>
+            <input type="date" className="inp" value={toInputDate(f.depart)}
+              onChange={e=>{
+                const v=e.target.value;
+                if(!v){s('depart','');return;}
+                const p=v.split('-');
+                s('depart',`${p[2]}/${p[1]}/${p[0].slice(2)}`);
+              }}
+              style={{colorScheme:'light'}}/>
+          </div>
+        </div>
+
+        <div className="frow"><label className="lbl">Observations</label>
+          <textarea className="inp" value={getObs(f)} onChange={e=>s('conducteur',encodeColor(colorOverride,e.target.value))}
+            rows={2} style={{resize:'vertical',fontFamily:'IBM Plex Sans,sans-serif',fontSize:13}}/>
+        </div>
+
+        {!isEdit&&(
+          <div style={{background:'#f5f3ed',borderRadius:7,padding:'12px 14px',border:'1px solid #e0ddd5',marginBottom:14}}>
+            <label className="lbl" style={{marginBottom:8}}>Durée</label>
+            {/* eqFactor: en 2x8, 1 équipe = 1 demi-j ; en 1x8, 1 équipe = 2 demi-j */}
+            {(()=>{
+              const eqF=mode==='2x8'?1:2;
+              const presets=mode==='2x8'?[1,2,3,4,5,6]:[0.5,1,1.5,2,2.5,3];
+              return(<>
+                <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
+                  {presets.map(v=>(
+                    <button key={v} type="button" onClick={()=>setHdCount(v*eqF)} style={{
+                      padding:'6px 10px',borderRadius:5,border:'2px solid',
+                      borderColor:hdCount===v*eqF?'#8a6a20':'#ddd',
+                      background:hdCount===v*eqF?'#8a6a20':'#fff',
+                      color:hdCount===v*eqF?'#fff':'#555',
+                      fontSize:12,fontWeight:700,cursor:'pointer',
+                      fontFamily:'IBM Plex Mono,monospace',minWidth:44,
+                    }}>{v} éq</button>
+                  ))}
+                  <div style={{display:'flex',alignItems:'center',gap:6,marginLeft:4}}>
+                    <input type="number" min={mode==='2x8'?1:0.5} step={mode==='2x8'?1:0.5} value={hdCount/eqF}
+                      onChange={e=>setHdCount(Math.max(mode==='2x8'?1:0.5,parseFloat(e.target.value)||0.5)*eqF)}
+                      style={{width:70,padding:'5px 8px',borderRadius:5,border:'2px solid #ddd',
+                        background:'#fff',fontSize:13,fontFamily:'IBM Plex Mono,monospace',fontWeight:700}}/>
+                    <span style={{fontSize:11,color:'#888'}}>éq</span>
+                  </div>
+                </div>
+                <div style={{fontSize:12,color:'#555',lineHeight:1.6,background:'#fff',borderRadius:5,padding:'7px 10px',border:'1px solid #e8e5e0'}}>
+                  <strong>{hdCount/eqF} éq</strong> = <strong>{hdCount} demi-j</strong> = <strong>{hdCount*hpd}h</strong>
+                  <span style={{color:'#aaa',fontSize:10,marginLeft:6}}>({f.machine} · {mode==='2x8'?'2×8':'journée'})</span>
+                </div>
+              </>);
+            })()}
+          </div>
+        )}
+
+        <div className="frow">
+          <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}}>
+            <input type="checkbox" checked={f.bold} onChange={e=>s('bold',e.target.checked)} style={{width:16,height:16,accentColor:'#2d6a4f'}}/>
+            Feuilles reçues — prêt à produire (barre verte ✓)
+          </label>
+        </div>
+        <div className="frow">
+          <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontSize:13}}>
+            <input type="checkbox" checked={getDone(f)} onChange={e=>s('conducteur',encodeColor(colorOverride,getObs(f),e.target.checked))} style={{width:16,height:16,accentColor:'#888'}}/>
+            OF terminé (grisé sur le planning)
+          </label>
+        </div>
+
+        {isEdit&&(
+          <div style={{background:'#f5f3ed',borderRadius:7,padding:'12px 14px',border:'1px solid #e0ddd5',marginTop:4,marginBottom:2}}>
+            {(()=>{
+              const eqF=mode==='2x8'?1:2;
+              const presets=mode==='2x8'?[1,2,3,4,5,6]:[0.5,1,1.5,2,2.5,3];
+              return(<>
+                <div style={{fontSize:10,color:'#8a8880',textTransform:'uppercase',letterSpacing:1,marginBottom:8,fontFamily:'IBM Plex Mono,monospace'}}>
+                  Durée
+                </div>
+                <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
+                  {presets.map(v=>(
+                    <button key={v} type="button" onClick={()=>setNewDur(v*eqF)} style={{
+                      padding:'6px 10px',borderRadius:5,border:'2px solid',
+                      borderColor:newDur===v*eqF?'#8a6a20':'#ddd',
+                      background:newDur===v*eqF?'#8a6a20':'#fff',
+                      color:newDur===v*eqF?'#fff':'#555',
+                      fontSize:12,fontWeight:700,cursor:'pointer',
+                      fontFamily:'IBM Plex Mono,monospace',minWidth:44,
+                    }}>{v} éq</button>
+                  ))}
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <button type="button" onClick={()=>setNewDur(d=>Math.max(eqF*(mode==='2x8'?1:0.5), d-eqF*(mode==='2x8'?1:0.5)))}
+                    style={{width:32,height:32,borderRadius:5,border:'2px solid #ddd',background:'#fff',
+                      fontSize:18,fontWeight:700,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>−</button>
+                  <input type="number" min={mode==='2x8'?1:0.5} step={mode==='2x8'?1:0.5} value={newDur/eqF}
+                    onChange={e=>setNewDur(Math.max(mode==='2x8'?1:0.5,parseFloat(e.target.value)||0.5)*eqF)}
+                    style={{width:60,padding:'5px 8px',borderRadius:5,border:'2px solid #ddd',
+                      background:'#fff',fontSize:14,fontFamily:'IBM Plex Mono,monospace',fontWeight:700,textAlign:'center'}}/>
+                  <span style={{fontSize:13,color:'#888',fontWeight:600}}>éq</span>
+                  <button type="button" onClick={()=>setNewDur(d=>d+eqF*(mode==='2x8'?1:0.5))}
+                    style={{width:32,height:32,borderRadius:5,border:'2px solid #ddd',background:'#fff',
+                      fontSize:18,fontWeight:700,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>+</button>
+                </div>
+              </>);
+            })()}
+          </div>
+        )}
+
+        <div style={{display:'flex',gap:8,marginTop:20,justifyContent:'flex-end'}}>
+          {isEdit&&<button className="btn btn-danger" onClick={()=>{if(confirm('Supprimer cet OF ?'))onDel(f.id)}}>Supprimer</button>}
+          <button className="btn" onClick={onClose}>Annuler</button>
+          <button className="btn btn-primary" onClick={async ()=>{
+            const {_showPalette,...fClean}=f;
+            await onSave({...fClean,conducteur:encodeColor(colorOverride,getObs(f),getDone(f))},hdCount,modal.data);
+            if(isEdit && newDur!==curDuration){
+              onResize(modal.data.machine,modal.data.of_number,modal.data.client,modal.data.designation,modal.data.slot,newDur);
+            }
+          }}>{isEdit?'Enregistrer':'Ajouter'}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function SaturdayModal({date, machines, onClose, onSave}){
+  const d=pd(date);
+  const label=['Dim','Lun','Mar','Mer','Jeu','Ven','Sam'][d.getDay()]+' '+
+    d.getDate()+'/'+(d.getMonth()+1)+'/'+String(d.getFullYear()).slice(2);
+  const [sel,setSel]=React.useState([...machines]);
+
+  function toggle(m){
+    setSel(s=>s.includes(m)?s.filter(x=>x!==m):[...s,m]);
+  }
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',
+      alignItems:'center',justifyContent:'center',zIndex:120}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',borderRadius:10,padding:28,width:380,
+        boxShadow:'0 20px 60px rgba(0,0,0,.25)'}}>
+        <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#8a6a20',
+          letterSpacing:1,marginBottom:16,textTransform:'uppercase'}}>
+          📅 Samedi {label}
+        </div>
+        <div style={{fontSize:12,color:'#666',marginBottom:16}}>
+          Cochez les machines ouvertes ce samedi :
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:20}}>
+          {MACHINES.map(m=>(
+            <label key={m} style={{display:'flex',alignItems:'center',gap:10,
+              padding:'8px 12px',borderRadius:6,cursor:'pointer',
+              background:sel.includes(m)?'#d4eaff':'#f5f5f0',
+              border:sel.includes(m)?'1px solid #90c4f0':'1px solid #e0e0d8',
+              transition:'all .15s'}}>
+              <input type="checkbox" checked={sel.includes(m)} onChange={()=>toggle(m)}
+                style={{width:15,height:15,accentColor:'#104070'}}/>
+              <span style={{fontWeight:sel.includes(m)?700:400,fontSize:13}}>{m}</span>
+            </label>
+          ))}
+        </div>
+        {sel.length===0&&(
+          <div style={{fontSize:11,color:'#c00',marginBottom:12,padding:'6px 10px',
+            background:'#fff5f5',borderRadius:5,border:'1px solid #fcc'}}>
+            ⚠ Aucune machine sélectionnée — le samedi sera supprimé du planning.
+          </div>
+        )}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
+          <button className="btn" onClick={onClose}>Annuler</button>
+          <button className="btn btn-primary" onClick={()=>onSave(date,sel)}>
+            {sel.length===0?'Fermer ce samedi':'Valider'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Settings({sets,onChange,onClose}){
+  const [loc,setLoc]=useState(JSON.parse(JSON.stringify(sets)));
+
+  const inp={padding:'6px 8px',borderRadius:5,border:'1px solid #ddd',background:'#f5f5f0',fontSize:12,fontFamily:'IBM Plex Sans,sans-serif'};
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'flex-start',justifyContent:'flex-end',zIndex:100}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',width:480,height:'100vh',overflowY:'auto',boxShadow:'-10px 0 40px rgba(0,0,0,.2)',padding:28}}>
+        <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#8a6a20',letterSpacing:1,marginBottom:24,textTransform:'uppercase'}}>⚙ Paramètres</div>
+
+
+
+        <div>
+          <div style={{fontSize:10,color:'#8a8880',textTransform:'uppercase',letterSpacing:1,marginBottom:8,paddingBottom:6,borderBottom:'1px solid #eee',fontFamily:'IBM Plex Mono,monospace'}}>Régimes horaires</div>
+          <div style={{fontSize:11,color:'#888',marginBottom:12,lineHeight:1.5,background:'#f5f5f0',padding:'8px 12px',borderRadius:6}}>
+            Le régime 1×8 / 2×8 se paramètre <strong>directement dans le planning</strong> en cliquant sur la rangée grise au-dessus de chaque machine, jour par jour.
+          </div>
+        </div>
+
+        <div style={{display:'flex',gap:8,marginTop:24}}>
+          <button className="btn" onClick={onClose}>Annuler</button>
+          <button className="btn btn-primary" onClick={()=>{onChange(loc);onClose();}}>Enregistrer</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClientsManager({onClose}){
+  const [list,setList]=useState([]);
+  const [search,setSearch]=useState('');
+  const [newName,setNewName]=useState('');
+  const [loading,setLoading]=useState(true);
+  const [msg,setMsg]=useState('');
+
+  async function load(){
+    setLoading(true);
+    const data=await sb('clients?order=nom&select=*');
+    setList(data||[]);
+    setLoading(false);
+  }
+  useEffect(()=>{load();},[]);
+
+  async function add(){
+    const n=newName.trim();
+    if(!n) return;
+    try{
+      await sb('clients',{method:'POST',body:JSON.stringify({nom:n}),prefer:'return=minimal'});
+      setNewName('');setMsg('✓ Ajouté');setTimeout(()=>setMsg(''),2000);load();
+    }catch(e){setMsg('Erreur: '+e.message);}
+  }
+
+  async function del(id,nom){
+    if(!confirm('Supprimer "'+nom+'" de la liste ?')) return;
+    try{
+      await sb('clients?id=eq.'+id,{method:'DELETE',prefer:'return=minimal'});
+      setMsg('✓ Supprimé');setTimeout(()=>setMsg(''),2000);load();
+    }catch(e){setMsg('Erreur: '+e.message);}
+  }
+
+  const filtered=list.filter(c=>c.nom.toLowerCase().includes(search.toLowerCase()));
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'flex-start',justifyContent:'flex-end',zIndex:110}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',width:420,height:'100vh',overflowY:'auto',boxShadow:'-10px 0 40px rgba(0,0,0,.2)',padding:28,display:'flex',flexDirection:'column'}}>
+        <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#8a6a20',letterSpacing:1,marginBottom:20,textTransform:'uppercase'}}>
+          👥 Gestion des clients
+        </div>
+
+        {/* Add new */}
+        <div style={{display:'flex',gap:8,marginBottom:16}}>
+          <input className="inp" placeholder="Nouveau client…" value={newName}
+            onChange={e=>setNewName(e.target.value)}
+            onKeyDown={e=>e.key==='Enter'&&add()}
+            style={{flex:1}}/>
+          <button className="btn btn-primary" onClick={add}>Ajouter</button>
+        </div>
+        {msg&&<div style={{fontSize:12,color:msg.startsWith('✓')?'#2d6a4f':'#c00',marginBottom:10}}>{msg}</div>}
+
+        {/* Search */}
+        <input className="inp" placeholder="🔍 Rechercher…" value={search}
+          onChange={e=>setSearch(e.target.value)}
+          style={{marginBottom:12}}/>
+
+        <div style={{fontSize:11,color:'#aaa',marginBottom:8}}>{filtered.length} client{filtered.length>1?'s':''}</div>
+
+        {/* List */}
+        <div style={{flex:1,overflowY:'auto'}}>
+          {loading ? <div style={{color:'#aaa',fontSize:13}}>Chargement…</div> :
+            filtered.map(c=>(
+              <div key={c.id} style={{display:'flex',alignItems:'center',padding:'7px 10px',borderRadius:5,marginBottom:3,background:'#f9f9f7',border:'1px solid #eeede8'}}>
+                <span style={{flex:1,fontSize:13}}>{c.nom}</span>
+                <button onClick={()=>del(c.id,c.nom)}
+                  style={{padding:'2px 8px',borderRadius:4,border:'1px solid #fcc',background:'#fff5f5',color:'#c00',fontSize:11,cursor:'pointer'}}>
+                  ✕
+                </button>
+              </div>
+            ))
+          }
+        </div>
+
+        <button className="btn" style={{marginTop:16}} onClick={onClose}>Fermer</button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.render(<App/>,document.getElementById('root'));
+</script>
+</body>
+</html>
