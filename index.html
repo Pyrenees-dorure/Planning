@@ -251,10 +251,24 @@ function mkBands(machine, slot, subCols, lkp){
     var hasOf=r&&!special;
     if(hasOf){
       var k=(r.of_number||'')+'§'+r.client+'§'+(r.designation||'');
-      if(cur&&cur.k===k){cur.ei=i;cur.rows.push(r);if(r.bold)cur.bold=true;}
-      else{
+      // Si of_id existe dans la row (colonne DB), l'utiliser comme identifiant unique
+      // Sinon : on casse la bande dès qu'il y a le moindre risque de confusion
+      // → on ne fusionne JAMAIS deux slots si le slot courant pourrait être un OF différent
+      // La seule façon sûre sans of_id : on accepte la fusion SEULEMENT si le slot précédent
+      // avait exactement le même depart, qte, format et mac (5 champs identiques = même OF)
+      var sameOf=cur&&cur.baseKey===k&&cur.ei===i-1&&
+        cur.fr.depart===(r.depart||'')&&
+        (cur.fr.qte||'')===(r.qte||'')&&
+        (cur.fr.format||'')===(r.format||'')&&
+        (cur.fr.mac||'')===(r.mac||'')&&
+        (cur.fr.conducteur||'')===(r.conducteur||'');
+      if(r.of_id) sameOf=cur&&cur.ofId===r.of_id&&cur.ei===i-1;
+      if(sameOf){
+        cur.ei=i;cur.rows.push(r);if(r.bold)cur.bold=true;
+      } else {
         if(cur)bands.push(cur);
-        cur={k,si:i,ei:i,rows:[r],fr:r,of_number:r.of_number,client:r.client,
+        cur={k:k+'§'+r.date+'§'+(r.half_day||1),baseKey:k,ofId:r.of_id||null,
+             si:i,ei:i,rows:[r],fr:r,of_number:r.of_number,client:r.client,
              designation:r.designation,mac:r.mac,qte:r.qte,depart:r.depart,
              conducteur:r.conducteur,bold:r.bold};
       }
@@ -270,7 +284,8 @@ function mkBands(machine, slot, subCols, lkp){
 function App(){
   const [rows,setRows]=useState([]);
   const [regimes,setRegimes]=useState({});
-  const [satConfigs,setSatConfigs]=useState({}); // key: date → [machines]
+  const [satConfigs,setSatConfigs]=useState({});
+  const [closures,setClosures]=useState({}); // key: machine|date → true
   const [clients,setClients]=useState([]);
   const [satModal,setSatModal]=useState(null); // {date, machines:[]}
   const [dates,setDates]=useState([]);
@@ -300,13 +315,17 @@ function App(){
     // Rechargement léger après mutations (planning + régimes seulement)
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
-      const [data,regData]=await Promise.all([
+      const [data,regData,closureData]=await Promise.all([
         sb('planning?order=date,machine,slot,half_day&select=*'),
         sb('machine_regime?select=*'),
+        sb('machine_closure?select=*'),
       ]);
       const rm={};
       (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
       setRegimes(rm);
+      const cl={};
+      (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
+      setClosures(cl);
       const r=data||[];
       setRows(r);
       // Recalcul dates si un OF dépasse la plage
@@ -331,15 +350,19 @@ function App(){
     // Chargement complet (initial + auto-sync + après changement satConfig/clients)
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
-      const [data,cliData,regData,satData]=await Promise.all([
+      const [data,cliData,regData,satData,closureData]=await Promise.all([
         sb('planning?order=date,machine,slot,half_day&select=*'),
         sb('clients?order=nom&select=nom'),
         sb('machine_regime?select=*'),
         sb('saturday_config?select=*'),
+        sb('machine_closure?select=*'),
       ]);
       const sc={};
       (satData||[]).forEach(r=>{sc[r.date]=r.machines||[];});
       setSatConfigs(sc);
+      const cl={};
+      (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
+      setClosures(cl);
       setClients((cliData||[]).map(c=>c.nom));
       const rm={};
       (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
@@ -443,14 +466,105 @@ function App(){
       cache[machine]=subCols.filter(sc=>{
         const dow=pd(sc.date).getDay();
         if(dow===6) return (satConfigs[sc.date]||[]).includes(machine);
+        if(closures[machine+'|'+sc.date]) return false; // jour fermé
         return true;
       });
     });
     return cache;
-  },[subCols,satConfigs]);
+  },[subCols,satConfigs,closures]);
 
   function getMachineSubCols(machine){
     return machineSubColsCache[machine]||subCols;
+  }
+
+  // Fermer une machine pour une journée entière
+  async function saveClosure(machine, date){
+    busyRef.current=true;
+    try{
+      // 1. Enregistrer la fermeture
+      await sb('machine_closure',{method:'POST',body:JSON.stringify({machine,date}),prefer:'return=minimal'});
+      const newClosures={...closures,[machine+'|'+date]:true};
+      setClosures(newClosures);
+
+      // 2. Décaler les OFs affectés (comme pour le samedi fermé)
+      // Construire extCols avec le jour, extColsNoClose sans
+      const allDatesSet=new Set(dates);
+      const extCols=[...allDatesSet].sort((a,b)=>pd(a)-pd(b)).flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
+      const extColsNo=[...allDatesSet].filter(d=>!(newClosures[machine+'|'+d])).sort((a,b)=>pd(a)-pd(b)).flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
+      const closeI=extCols.findIndex(c=>c.date===date&&c.hd===1);
+
+      const toShift=rows.filter(r=>{
+        if(r.machine!==machine) return false;
+        const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+        return ri>=closeI;
+      });
+      if(toShift.length>0){
+        const ids=toShift.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+        const payload=toShift.map(r=>{
+          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          // Trouver la même position dans extColsNo (le jour fermé disparaît → slots se décalent)
+          // On cherche la position équivalente en ignorant les jours fermés
+          const noI=extColsNo.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          if(noI<0) return null; // slot sur jour fermé → sera déplacé au prochain dispo
+          const {id,...rest}=r;
+          return {...rest,date:extColsNo[noI]?.date||r.date,half_day:extColsNo[noI]?.hd||r.half_day};
+        }).filter(Boolean);
+        if(payload.length>0) await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+      }
+    }catch(e){showToast('Erreur fermeture: '+e.message);}
+    finally{busyRef.current=false;}
+    loadPlanning();
+  }
+
+  async function openClosure(machine, date){
+    busyRef.current=true;
+    try{
+      // Construire les subCols AVANT réouverture (jour encore fermé)
+      const allDatesArr=[...new Set(dates)].sort((a,b)=>pd(a)-pd(b));
+      const extColsOld=allDatesArr
+        .filter(d=>!closures[machine+'|'+d]) // état actuel : jour fermé exclu
+        .flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
+
+      // Supprimer la fermeture en DB
+      await sb('machine_closure?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
+        {method:'DELETE',prefer:'return=minimal'});
+      const newClosures={...closures};
+      delete newClosures[machine+'|'+date];
+      setClosures(newClosures);
+
+      // Construire les subCols APRÈS réouverture (jour inclus)
+      const extColsNew=allDatesArr
+        .filter(d=>!newClosures[machine+'|'+d])
+        .flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
+
+      // Premier slot APRÈS la date réouverte dans extColsOld
+      const firstAfterOld=extColsOld.findIndex(c=>pd(c.date)>pd(date));
+      if(firstAfterOld<0){} // rien après → pas de décalage
+      else{
+        const toShift=rows.filter(r=>{
+          if(r.machine!==machine) return false;
+          const ri=extColsOld.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+          return ri>=firstAfterOld;
+        });
+        if(toShift.length>0){
+          const ids=toShift.map(r=>r.id).join(',');
+          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+          const payload=toShift.map(r=>{
+            // Position ri dans extColsOld → extColsNew[ri] = 2 slots plus tôt (le jour réouvert s'insère avant)
+            const ri=extColsOld.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+            const nc=extColsNew[ri];
+            if(!nc) return null;
+            const {id,...rest}=r;
+            return {...rest,date:nc.date,half_day:nc.hd};
+          }).filter(Boolean);
+          if(payload.length>0)
+            await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+        }
+      }
+    }catch(e){showToast('Erreur ouverture: '+e.message);}
+    finally{busyRef.current=false;}
+    loadPlanning();
   }
 
   // filter dates by search
@@ -833,11 +947,13 @@ function App(){
         return;
       }
 
-      // Build new slots to add for growing OF
+      // Build new slots to add for growing OF — en utilisant les subCols de la machine (jours fermés exclus)
+      const msc=getMachineSubCols(machine);
+      const lastIdxMsc=msc.findIndex(c=>c.date===last.date&&c.hd===(last.half_day||1));
       const addSlots=[];
       for(let i=1;i<=extra;i++){
-        const ni=lastIdx+i;
-        if(ni<subCols.length) addSlots.push(subCols[ni]);
+        const ni=lastIdxMsc+i;
+        if(ni<msc.length) addSlots.push(msc[ni]);
       }
 
       // Only push OFs that actually overlap the new slots (respect free gaps)
@@ -854,21 +970,24 @@ function App(){
       });
       const sortedGroupsR=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
 
-      // Cascade push: only groups that collide with new slots, then stop at gap
+      // Cascade push via msc (machine subCols)
+      const mscMap=new Map(); msc.forEach((c,i)=>mscMap.set(c.date+'|'+c.hd,i));
       const toShiftRows=[];
-      let pushEndR=lastIdx+extra+1;
+      let pushEndR=lastIdxMsc+extra+1;
       for(const grp of sortedGroupsR){
-        if(grp.minIdx>=pushEndR) break; // gap — stop
-        if(grp.maxIdx<=lastIdx) continue; // entirely before new slots
+        const grpMinMsc=Math.min(...grp.rows.map(r=>mscMap.get(r.date+'|'+(r.half_day||1))??Infinity));
+        const grpMaxMsc=Math.max(...grp.rows.map(r=>mscMap.get(r.date+'|'+(r.half_day||1))??-1));
+        if(grpMinMsc>=pushEndR) break;
+        if(grpMaxMsc<=lastIdxMsc) continue;
         grp.rows.forEach(r=>toShiftRows.push(r));
-        pushEndR=Math.max(pushEndR, grp.maxIdx+extra+1);
+        pushEndR=Math.max(pushEndR, grpMaxMsc+extra+1);
       }
 
       const shiftMoves=toShiftRows.map(r=>{
-        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-        if(ri<=lastIdx) return null; // don't move parts before extension
+        const ri=mscMap.get(r.date+'|'+(r.half_day||1));
+        if(ri===undefined||ri<=lastIdxMsc) return null;
         const ni=ri+extra;
-        return {r, nc: ni<subCols.length ? subCols[ni] : null};
+        return {r, nc: ni<msc.length ? msc[ni] : null};
       }).filter(m=>m&&m.nc!==null);
       const toShift=toShiftRows;
 
@@ -1421,7 +1540,9 @@ function App(){
                 {/* Slot 1 bands */}
                 {b1.map((band,bi)=>{
                   if(band.special){
-                    return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                    return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+                      onClick={()=>setModal({type:'edit',data:{...band.row}})}
+                    >
                       <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
                     </div>;
                   }
@@ -1504,6 +1625,25 @@ function App(){
                   if(used1.has(sci))return null;
                   const k=machine+'|'+date+'|'+hd+'|1';
                   const isM=hd===1;
+                  const isClosed=closures[machine+'|'+date];
+                  if(isClosed){
+                    // Afficher seulement le matin (span 2 demi-j) avec hachuré
+                    if(!isM) return null;
+                    return(
+                      <div key={'e1'+sci} style={{
+                        gridRow:r1,gridColumn:sci+2+'/'+(sci+4),
+                        background:'repeating-linear-gradient(45deg,#e8e5e0,#e8e5e0 4px,#f0eee8 4px,#f0eee8 8px)',
+                        borderBottom:'1px solid #d0ccc5',borderRight:'1px solid #d0ccc5',
+                        cursor:'pointer',position:'relative',
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                      }}
+                        onClick={()=>openClosure(machine,date)}
+                        title={`Machine fermée le ${date} — cliquer pour rouvrir`}
+                      >
+                        <span style={{fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',fontWeight:700,background:'rgba(255,255,255,.7)',padding:'1px 5px',borderRadius:3}}>🔒 FERMÉ</span>
+                      </div>
+                    );
+                  }
                   return(
                     <div key={'e1'+sci} style={{
                       gridRow:r1,gridColumn:sci+2,
@@ -1525,7 +1665,7 @@ function App(){
         </div>
       </div>
 
-      {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={rows} subCols={subCols} dates={dates} sets={sets} sat={sat} clients={clients}/>}
+      {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={rows} subCols={subCols} dates={dates} sets={sets} sat={sat} clients={clients} onCloseMachine={saveClosure}/>}
       {showSet&&<Settings sets={sets} onChange={upd} onClose={()=>setShowSet(false)}/>}
       {showClients&&<ClientsManager onClose={()=>{setShowClients(false);load();}}/>}
       {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
@@ -1535,7 +1675,7 @@ function App(){
   );
 }
 
-function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dates,sets,sat,clients}){
+function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dates,sets,sat,clients,onCloseMachine}){
   const isEdit=modal.type==='edit';
   const [f,setF]=useState({...modal.data});
   const [hdCount,setHdCount]=useState(2); // half-days, default 1j
@@ -1794,6 +1934,18 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
 
         <div style={{display:'flex',gap:8,marginTop:20,justifyContent:'flex-end'}}>
           {isEdit&&<button className="btn btn-danger" onClick={()=>{if(confirm('Supprimer cet OF ?'))onDel(f.id)}}>Supprimer</button>}
+          {!isEdit&&onCloseMachine&&(
+            <button type="button" onClick={()=>{
+              if(confirm('Fermer la machine '+f.machine+' le '+f.date+' ?')){
+                onCloseMachine(f.machine,f.date);
+                onClose();
+              }
+            }} style={{
+              padding:'6px 13px',borderRadius:5,border:'1px solid #888',
+              background:'#f5f0e8',color:'#5a3e00',fontSize:12,fontWeight:600,
+              cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',
+            }}>🔒 Fermer la machine ce jour</button>
+          )}
           <button className="btn" onClick={onClose}>Annuler</button>
           <button className="btn btn-primary" onClick={async ()=>{
             const {_showPalette,...fClean}=f;
