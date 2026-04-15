@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <title>Planning PDD</title>
+<link rel="preload" href="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" as="script">
+<link rel="preload" href="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" as="script">
+<link rel="preload" href="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" as="script">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
@@ -197,11 +200,17 @@ function getModeForDate(sets,machine,date){
 
 // Plan OF: returns array of {date, half_day} starting from startDate/startHalfDay
 // duration in half-days (e.g. 1.5 = 3 half-day slots)
-function planHalfDays(halfDays, startDate, startHD, sets, machine, sat, regimes, openSats){
-  // openSats: Set of open Saturday date strings
+function planHalfDays(halfDays, startDate, startHD, sets, machine, sat, regimes, openSats, closedDays){
   var openSatsSet=openSats||new Set();
+  var closedSet=closedDays||new Set();
   var slots=[], date=startDate, hd=startHD, count=0;
   while(count<halfDays && slots.length<400){
+    // Sauter les jours fermés
+    while(closedSet.has(date)){
+      var d2=pd(date); d2.setDate(d2.getDate()+1);
+      while(!isWD(d2,sat) && !openSatsSet.has(fd(d2))){ d2.setDate(d2.getDate()+1); }
+      date=fd(d2); hd=1;
+    }
     slots.push({date, half_day:hd});
     count++;
     if(hd===1){hd=2;}
@@ -209,10 +218,8 @@ function planHalfDays(halfDays, startDate, startHD, sets, machine, sat, regimes,
       hd=1;
       var d=pd(date);
       d.setDate(d.getDate()+1);
-      // Advance to next valid day: workday OR open Saturday
-      while(!isWD(d,sat) && !openSatsSet.has(fd(d))){
-        d.setDate(d.getDate()+1);
-      }
+      // Advance to next valid day: workday OR open Saturday, skip closed days
+      while(!isWD(d,sat) && !openSatsSet.has(fd(d))){ d.setDate(d.getDate()+1); }
       date=fd(d);
     }
   }
@@ -234,7 +241,7 @@ function saveS(s){localStorage.setItem('pdd4',JSON.stringify(s));}
 </script>
 
 <script type="text/babel">
-const {useState,useEffect,useRef,useMemo,useCallback}=React;
+const {useState,useEffect,useLayoutEffect,useRef,useMemo,useCallback}=React;
 
 // Build sorted list of (date, half_day) pairs from workdays
 function buildSubCols(dates, sat){
@@ -383,31 +390,37 @@ function App(){
       Object.keys(sc||{}).forEach(d=>{if((sc[d]||[]).length>0)allD.add(d);});
       const sortedDates_=[...allD].sort((a,b)=>pd(a)-pd(b));
       setDates(sortedDates_);
-      if(!scrolledRef.current && gridRef.current){
+      if(!scrolledRef.current){
         const todayIdx=sortedDates_.indexOf(fd(new Date()));
-        if(todayIdx>=0){
-          setTimeout(()=>{
-            if(gridRef.current){
-              gridRef.current.scrollLeft=Math.max(0, LW+(todayIdx*2-5)*hdw-80);
-              scrolledRef.current=true;
-            }
-          }, 100);
-        }
+        if(todayIdx>=0) initialScrollIdx.current=todayIdx;
       } else if(savedScroll!==null){
         setTimeout(()=>{if(gridRef.current) gridRef.current.scrollLeft=savedScroll;}, 30);
       }
     }catch(e){showToast('Erreur: '+e.message);}
-    setLoading(false);
+    if(loading) setLoading(false); // seulement au premier chargement
   }
+
+  const modalOpenRef=useRef(false);
+  useEffect(()=>{modalOpenRef.current=!!modal;},[modal]);
 
   useEffect(()=>{
     load();
-    const t=setInterval(()=>{ if(!busyRef.current) load(); },30000);
+    const t=setInterval(()=>{ if(!busyRef.current && !modalOpenRef.current) load(); },30000);
     return()=>clearInterval(t);
   },[sat]);
 
   // scrolledRef tracks whether we've done the initial scroll to today
   const scrolledRef=useRef(false);
+  const initialScrollIdx=useRef(-1);
+
+  // Scroll instantané dès que le grid est rendu (useLayoutEffect = avant paint)
+  useLayoutEffect(()=>{
+    if(!loading && !scrolledRef.current && initialScrollIdx.current>=0 && gridRef.current){
+      gridRef.current.scrollLeft=Math.max(0, LW+(initialScrollIdx.current*2-5)*hdw-80);
+      scrolledRef.current=true;
+      initialScrollIdx.current=-1;
+    }
+  },[loading,dates]);
   // Undo history: stack of {label, deleted:[], inserted:[]}
   const historyRef=useRef([]);
 
@@ -792,23 +805,57 @@ function App(){
       }catch(e2){showToast('Restauration partielle — Ctrl+Z');}
     }finally{busyRef.current=false;loadPlanning();}  }
 
-  async function onSave(formData, halfDayCount, origData){
+  async function onSave(formData, halfDayCount, origData, newDurOverride){
     try{
       if(modal.type==='add'){
         const startHD=formData.half_day||1;
         const openSatsForMachine=new Set(Object.entries(satConfigs)
           .filter(([d,ms])=>ms.includes(formData.machine))
           .map(([d])=>d));
-        const slots=planHalfDays(halfDayCount, formData.date, startHD, sets, formData.machine, sat, null, openSatsForMachine);
-        // Bulk INSERT
+        const closedDaysForMachine=new Set(Object.entries(closures)
+          .filter(([k])=>k.startsWith(formData.machine+'|'))
+          .map(([k])=>k.split('|')[1]));
+        const slots=planHalfDays(halfDayCount, formData.date, startHD, sets, formData.machine, sat, null, openSatsForMachine, closedDaysForMachine);
+
+        // Cascade push : uniquement les OFs qui chevauchent les slots du nouvel OF
+        const msc=getMachineSubCols(formData.machine);
+        const mscMap=new Map(); msc.forEach((c,i)=>mscMap.set(c.date+'|'+c.hd,i));
+        const newMscSet=new Set(slots.map(s=>mscMap.get(s.date+'|'+s.half_day)).filter(i=>i!==undefined));
+        const newLen=slots.length;
+
+        // Trouver les rows qui sont exactement sur un slot occupé par le nouvel OF
+        const conflictIds=new Set(rows
+          .filter(r=>r.machine===formData.machine&&r.slot===formData.slot&&newMscSet.has(mscMap.get(r.date+'|'+(r.half_day||1))))
+          .map(r=>r.id));
+
+        if(conflictIds.size>0){
+          // Récupérer tous les slots des OFs conflictuels (OF entier, pas juste les slots en conflit)
+          const conflictKeys=new Set(rows.filter(r=>conflictIds.has(r.id)).map(r=>r.of_number+'§'+r.client+'§'+r.designation));
+          const toShiftC=rows.filter(r=>
+            r.machine===formData.machine&&r.slot===formData.slot&&
+            conflictKeys.has(r.of_number+'§'+r.client+'§'+r.designation)
+          );
+          const ids=[...new Set(toShiftC.map(r=>r.id))].join(',');
+          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+          const shiftPayload=toShiftC.map(r=>{
+            const rmi=mscMap.get(r.date+'|'+(r.half_day||1));
+            if(rmi===undefined) return null;
+            const ni=rmi+newLen;
+            const nc=ni<msc.length?msc[ni]:null;
+            if(!nc) return null;
+            const {id,...rest}=r;
+            return {...rest,date:nc.date,half_day:nc.hd};
+          }).filter(Boolean);
+          if(shiftPayload.length>0)
+            await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=minimal'});
+        }
+
         const payload=slots.map(s=>({...formData,date:s.date,half_day:s.half_day}));
         const inserted=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
         pushHistory('Ajout '+formData.client, {deleted:[], inserted:inserted||[]});
-        // Auto-register new client
         if(formData.client) await sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
         showToast('✓ OF ajouté — '+slots.length+' demi-journée(s) · Ctrl+Z pour annuler');
       } else {
-        // Bulk PATCH via id=in.(...)
         const patch={
           of_number: formData.of_number,
           client: formData.client,
@@ -829,10 +876,15 @@ function App(){
           const ids=allOfRows.map(r=>r.id).join(',');
           await sb('planning?id=in.('+ids+')',{method:'PATCH',body:JSON.stringify(patch),prefer:'return=minimal'});
         }
-        // Undo: utilise les rows en mémoire (avant patch) comme "deleted", et les rows patchés comme "inserted"
         const patchedRows=allOfRows.map(r=>({...r,...patch}));
         pushHistory('Modif '+orig.client+'→'+formData.client, {deleted:patchedRows, inserted:allOfRows});
         showToast('✓ Mis à jour ('+allOfRows.length+' demi-j) · Ctrl+Z pour annuler');
+
+        // Resize intégré : on utilise allOfRows déjà connu (avant reload)
+        if(newDurOverride!==undefined && newDurOverride!==allOfRows.length){
+          await onResize(orig.machine, formData.of_number, formData.client, formData.designation, orig.slot, newDurOverride, patchedRows);
+          return;
+        }
       }
       setModal(null);loadPlanning();
     }catch(e){showToast('Erreur: '+e.message);}
@@ -926,8 +978,8 @@ function App(){
   }
 
   // Resize OF: change duration, pushing ALL subsequent OFs if growing
-  async function onResize(machine,of_number,client,designation,slot,newHalfDays){
-    const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
+  async function onResize(machine,of_number,client,designation,slot,newHalfDays,knownRows){
+    const ofR=(knownRows||rows).filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
       .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
     const curLen=ofR.length;
     if(newHalfDays===curLen){setModal(null);return;}
@@ -1006,6 +1058,7 @@ function App(){
         const res=await sb('planning',{method:'POST',
           body:JSON.stringify({machine,date:nc.date,half_day:nc.hd,slot,
             of_number,client,designation,mac:last.mac,qte:last.qte,
+            format:last.format||'',
             depart:last.depart,conducteur:last.conducteur,bold:last.bold}),
           prefer:'return=representation'});
         if(res&&res[0]) actualInserted.push(res[0]);
@@ -1038,11 +1091,16 @@ function App(){
 
       // Build extended subCols including Saturday slots
       // This is the full sequence: ...FriM, FriPM, SatM, SatPM, MonM, MonPM...
-      function buildExtSubCols(withSat){
-        // withSat: boolean - include Saturday date?
+      function buildExtSubCols(withSat, machine){
         const allDates=new Set(dates);
         if(withSat) allDates.add(date);
-        else allDates.delete(date); // dates contient déjà le Sam s'il était ouvert — le supprimer explicitement
+        else allDates.delete(date);
+        // Exclure les jours fermés de la machine
+        if(machine){
+          Object.keys(closures).forEach(k=>{
+            if(k.startsWith(machine+'|')) allDates.delete(k.split('|')[1]);
+          });
+        }
         const sorted=[...allDates].sort((a,b)=>pd(a)-pd(b));
         const cols=[];
         sorted.forEach(d=>{ cols.push({date:d,hd:1}); cols.push({date:d,hd:2}); });
@@ -1058,7 +1116,7 @@ function App(){
       // Simple: each row shifts by -2 in the extended subcols
 
       for(const machine of newlyAdded){
-        const extCols=buildExtSubCols(true);
+        const extCols=buildExtSubCols(true,machine);
         const toShift=rows.filter(r=>{
           if(r.machine!==machine) return false;
           const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
@@ -1088,7 +1146,7 @@ function App(){
       // Row at satDate/hd:1 → monDate/hd:1, satDate/hd:2 → monDate/hd:2,
       // monDate/hd:1 → nextDate/hd:1, etc.
       for(const machine of newlyRemoved){
-        const extCols=buildExtSubCols(true); // still has Saturday in it
+        const extCols=buildExtSubCols(true,machine); // still has Saturday in it
         const satI=extCols.findIndex(c=>c.date===date&&c.hd===1);
         const toShift=rows.filter(r=>{
           if(r.machine!==machine) return false;
@@ -1105,7 +1163,7 @@ function App(){
         // Reinsert at same index in extColsNoSat (Saturday removed → Mon shifts to satI)
         // SatM(satI in extCols) → extColsNoSat[satI] = MonM ✓
         // MonM(satI+2 in extCols) → extColsNoSat[satI+2] = TueM ✓ (gap preserved)
-        const extColsNoSat=buildExtSubCols(false);
+        const extColsNoSat=buildExtSubCols(false,machine);
         for(const r of [...toShift].reverse()){
           const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
           const ni=ri; // same index, Saturday slots just disappear
@@ -1343,9 +1401,9 @@ function App(){
         </div>
         <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:12,fontSize:11,color:'#888'}}>
           <span style={{display:'flex',alignItems:'center',gap:5}}>
-            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#d0f0cc',boxShadow:'inset 3px 0 0 #2d6a4f'}}/>Reçu</span>
+            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#d0f0cc'}}/>Reçu</span>
           <span style={{display:'flex',alignItems:'center',gap:5}}>
-            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#dce8ff',boxShadow:'inset 3px 0 0 #bbb'}}/>En attente</span>
+            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'repeating-linear-gradient(135deg,#dce8ff,#dce8ff 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px)'}}/>En attente</span>
           <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e67e22'}}/> Départ dans ≤2j ouvrés</span>
           <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e8001a'}}/> Départ dépassé</span>
           <span style={{fontSize:10,color:'#bbb'}}>Glisser = déplacer · Cliquer = éditer</span>
@@ -1560,7 +1618,8 @@ function App(){
                       borderRadius:'4px 4px 0 0',
                       padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
                       cursor:'grab',
-                      boxShadow:(!isDone&&band.bold)?'inset 4px 0 0 #2d6a4f':'inset 4px 0 0 rgba(0,0,0,.15)',
+                      
+                      backgroundImage:(isDone||band.bold)?'none':`repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px),linear-gradient(${color},${color})`,
                       zIndex:1,
                     }}
                       draggable={!resizeSrc} onDragStart={e=>onDS(e,band.fr)}
@@ -1692,7 +1751,7 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
   // newDur initialisé en demi-j correspondant à curEq dans le mode du premier slot
   const [newDur,setNewDur]=useState(()=>{
     if(!isEdit) return 2;
-    return Math.max(1, Math.round(curEqInit) * eqF0);
+    return Math.max(1, ofRowsInit.length); // demi-j exact, sans arrondi
   });
   // Color: auto from designation (fallback client), with manual override
   const autoColor=hc((f.designation||f.client||''));
@@ -1729,8 +1788,7 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
   function fromInputDate(s){if(!s)return'';const p=s.split('-');return`${p[2]}/${p[1]}/${p[2]?p[0].slice(2):''}`;}
 
   return(
-    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100}}
-      onClick={e=>e.target===e.currentTarget&&onClose()}>
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100}}>
       <div style={{background:'#fff',borderRadius:10,padding:24,width:500,maxWidth:'95vw',maxHeight:'92vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.25)'}}>
         <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#8a6a20',letterSpacing:1,marginBottom:20,textTransform:'uppercase'}}>
           {isEdit?'✏ Modifier l\'OF':'+ Nouvel OF'}
@@ -1949,10 +2007,8 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
           <button className="btn" onClick={onClose}>Annuler</button>
           <button className="btn btn-primary" onClick={async ()=>{
             const {_showPalette,...fClean}=f;
-            await onSave({...fClean,conducteur:encodeColor(colorOverride,getObs(f),getDone(f))},hdCount,modal.data);
-            if(isEdit && newDur!==curDuration){
-              onResize(modal.data.machine,modal.data.of_number,modal.data.client,modal.data.designation,modal.data.slot,newDur);
-            }
+            const savedForm={...fClean,conducteur:encodeColor(colorOverride,getObs(f),getDone(f))};
+            await onSave(savedForm,hdCount,modal.data,(isEdit&&newDur!==curDuration)?newDur:undefined);
           }}>{isEdit?'Enregistrer':'Ajouter'}</button>
         </div>
       </div>
