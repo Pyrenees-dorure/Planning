@@ -242,6 +242,7 @@ function saveS(s){localStorage.setItem('pdd4',JSON.stringify(s));}
 
 <script type="text/babel">
 const {useState,useEffect,useLayoutEffect,useRef,useMemo,useCallback}=React;
+const READONLY=new URLSearchParams(window.location.search).get('readonly')==='1';
 
 // Build sorted list of (date, half_day) pairs from workdays
 function buildSubCols(dates, sat){
@@ -823,18 +824,19 @@ function App(){
         const newMscSet=new Set(slots.map(s=>mscMap.get(s.date+'|'+s.half_day)).filter(i=>i!==undefined));
         const newLen=slots.length;
 
-        // Trouver les rows qui sont exactement sur un slot occupé par le nouvel OF
+        // Trouver les OFs conflictuels (entiers)
         const conflictIds=new Set(rows
           .filter(r=>r.machine===formData.machine&&r.slot===formData.slot&&newMscSet.has(mscMap.get(r.date+'|'+(r.half_day||1))))
           .map(r=>r.id));
+        const toShiftC=conflictIds.size>0 ? rows.filter(r=>{
+          if(r.machine!==formData.machine||r.slot!==formData.slot) return false;
+          const conflictKeys=new Set(rows.filter(x=>conflictIds.has(x.id)).map(x=>x.of_number+'§'+x.client+'§'+x.designation));
+          return conflictKeys.has(r.of_number+'§'+r.client+'§'+r.designation);
+        }) : [];
 
-        if(conflictIds.size>0){
-          // Récupérer tous les slots des OFs conflictuels (OF entier, pas juste les slots en conflit)
-          const conflictKeys=new Set(rows.filter(r=>conflictIds.has(r.id)).map(r=>r.of_number+'§'+r.client+'§'+r.designation));
-          const toShiftC=rows.filter(r=>
-            r.machine===formData.machine&&r.slot===formData.slot&&
-            conflictKeys.has(r.of_number+'§'+r.client+'§'+r.designation)
-          );
+        // CASCADE : bulk delete + bulk insert avec return=representation pour les IDs
+        let cascadeInserted=[];
+        if(toShiftC.length>0){
           const ids=[...new Set(toShiftC.map(r=>r.id))].join(',');
           await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
           const shiftPayload=toShiftC.map(r=>{
@@ -846,13 +848,19 @@ function App(){
             const {id,...rest}=r;
             return {...rest,date:nc.date,half_day:nc.hd};
           }).filter(Boolean);
-          if(shiftPayload.length>0)
-            await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=minimal'});
+          if(shiftPayload.length>0){
+            const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
+            cascadeInserted=res||[];
+          }
         }
 
         const payload=slots.map(s=>({...formData,date:s.date,half_day:s.half_day}));
         const inserted=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
-        pushHistory('Ajout '+formData.client, {deleted:[], inserted:inserted||[]});
+        // Undo complet : supprime nouvel OF + cascadés insérés, restaure cascadés originaux
+        pushHistory('Ajout '+formData.client, {
+          deleted: toShiftC,
+          inserted: [...(inserted||[]), ...cascadeInserted]
+        });
         if(formData.client) await sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
         showToast('✓ OF ajouté — '+slots.length+' demi-journée(s) · Ctrl+Z pour annuler');
       } else {
@@ -877,7 +885,8 @@ function App(){
           await sb('planning?id=in.('+ids+')',{method:'PATCH',body:JSON.stringify(patch),prefer:'return=minimal'});
         }
         const patchedRows=allOfRows.map(r=>({...r,...patch}));
-        pushHistory('Modif '+orig.client+'→'+formData.client, {deleted:patchedRows, inserted:allOfRows});
+        // Pour undo : supprimer les rows patchées (inserted=patchedRows) et réinsérer les anciennes (deleted=allOfRows)
+        pushHistory('Modif '+orig.client+'→'+formData.client, {deleted:allOfRows, inserted:patchedRows});
         showToast('✓ Mis à jour ('+allOfRows.length+' demi-j) · Ctrl+Z pour annuler');
 
         // Resize intégré : on utilise allOfRows déjà connu (avant reload)
@@ -1117,62 +1126,60 @@ function App(){
 
       for(const machine of newlyAdded){
         const extCols=buildExtSubCols(true,machine);
+        const ecMap=new Map(); extCols.forEach((c,i)=>ecMap.set(c.date+'|'+c.hd,i));
+        const monI=ecMap.get(monDate+'|1')??Infinity;
         const toShift=rows.filter(r=>{
           if(r.machine!==machine) return false;
-          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          const monI=extCols.findIndex(c=>c.date===monDate&&c.hd===1);
-          return ri>=monI;
-        }).sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-
+          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
+          return ri!==undefined && ri>=monI;
+        });
         if(toShift.length===0) continue;
 
-        // Delete all first
-        for(const r of toShift)
-          await sb('planning?id=eq.'+r.id,{method:'DELETE',prefer:'return=minimal'});
+        // Bulk DELETE
+        const ids=toShift.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
 
-        // Reinsert each shifted by -2 in extCols
-        for(const r of toShift){
-          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
+        // Bulk INSERT décalés de -2
+        const payload=toShift.map(r=>{
+          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
           const ni=ri-2;
-          if(ni>=0){
-            const nc=extCols[ni];
-            const {id,...rest}=r;
-            await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=minimal'});
-          }
-        }
+          if(ni<0) return null;
+          const nc=extCols[ni];
+          const {id,...rest}=r;
+          return {...rest,date:nc.date,half_day:nc.hd};
+        }).filter(Boolean);
+        if(payload.length>0)
+          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
       }
 
-      // CLOSE: each slot shifts by +2
-      // Row at satDate/hd:1 → monDate/hd:1, satDate/hd:2 → monDate/hd:2,
-      // monDate/hd:1 → nextDate/hd:1, etc.
       for(const machine of newlyRemoved){
-        const extCols=buildExtSubCols(true,machine); // still has Saturday in it
-        const satI=extCols.findIndex(c=>c.date===date&&c.hd===1);
+        const extCols=buildExtSubCols(true,machine);
+        const ecMap=new Map(); extCols.forEach((c,i)=>ecMap.set(c.date+'|'+c.hd,i));
+        const satI=ecMap.get(date+'|1')??Infinity;
         const toShift=rows.filter(r=>{
           if(r.machine!==machine) return false;
-          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          return ri>=satI;
-        }).sort((a,b)=>pd(b.date)-pd(a.date)||(b.half_day||1)-(a.half_day||1)); // reverse order
-
+          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
+          return ri!==undefined && ri>=satI;
+        });
         if(toShift.length===0) continue;
 
-        // Delete all first (reverse order to avoid conflicts)
-        for(const r of toShift)
-          await sb('planning?id=eq.'+r.id,{method:'DELETE',prefer:'return=minimal'});
-
-        // Reinsert at same index in extColsNoSat (Saturday removed → Mon shifts to satI)
-        // SatM(satI in extCols) → extColsNoSat[satI] = MonM ✓
-        // MonM(satI+2 in extCols) → extColsNoSat[satI+2] = TueM ✓ (gap preserved)
         const extColsNoSat=buildExtSubCols(false,machine);
-        for(const r of [...toShift].reverse()){
-          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          const ni=ri; // same index, Saturday slots just disappear
-          if(ni>=0&&ni<extColsNoSat.length){
-            const nc=extColsNoSat[ni];
-            const {id,...rest}=r;
-            await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=minimal'});
-          }
-        }
+        const ecNoMap=new Map(); extColsNoSat.forEach((c,i)=>ecNoMap.set(c.date+'|'+c.hd,i));
+
+        // Bulk DELETE
+        const ids=toShift.map(r=>r.id).join(',');
+        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+
+        // Bulk INSERT au même index dans extColsNoSat
+        const payload=toShift.map(r=>{
+          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
+          if(ri===undefined||ri>=extColsNoSat.length) return null;
+          const nc=extColsNoSat[ri];
+          const {id,...rest}=r;
+          return {...rest,date:nc.date,half_day:nc.hd};
+        }).filter(Boolean);
+        if(payload.length>0)
+          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
       }
 
     }catch(e){showToast('Erreur samedi: '+e.message);}
@@ -1359,8 +1366,8 @@ function App(){
         <input style={{padding:'6px 10px',borderRadius:5,border:'1px solid #ddd',background:'#f5f5f0',fontSize:12,width:200,fontFamily:'IBM Plex Sans,sans-serif'}}
           placeholder="🔍  Client, OF, désignation…" value={q} onChange={e=>setQ(e.target.value)}/>
         <div style={{width:1,height:22,background:'#ddd'}}/>
-        <button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>
-        <button onClick={()=>{
+        {!READONLY&&<button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>}
+        {!READONLY&&<button onClick={()=>{
           const todayIdx=filteredDates.indexOf(today);
           if(todayIdx>=0&&gridRef.current)
             gridRef.current.scrollLeft=Math.max(0,LW+(todayIdx*2-5)*hdw-80);
@@ -1371,8 +1378,8 @@ function App(){
         }}
           onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';}}
           onMouseLeave={e=>{e.currentTarget.style.background='#fff';}}
-        >📅 Aujourd'hui</button>
-        <button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
+        >📅 Aujourd'hui</button>}
+        {!READONLY&&<button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
           display:'flex',alignItems:'center',gap:6,
           padding:'6px 13px',borderRadius:5,
           border:'1px solid #b8b5aa',background:'#fff',
@@ -1383,7 +1390,7 @@ function App(){
           onMouseLeave={e=>{e.currentTarget.style.background='#fff';e.currentTarget.style.color='#555';}}
         >
           <span style={{fontSize:16,lineHeight:1}}>↩</span> Annuler
-        </button>
+        </button>}
         <div style={{display:'flex',alignItems:'center',gap:2,border:'1px solid #b8b5aa',borderRadius:5,overflow:'hidden'}}>
           <button onClick={zoomOut} title="Zoom arrière" style={{
             padding:'6px 10px',border:'none',background:'#fff',
@@ -1498,7 +1505,7 @@ function App(){
                     justifyContent:showOnSat?'flex-end':'flex-end',
                     pointerEvents:'none',
                   }}>
-                    <div onClick={()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
+                    <div onClick={READONLY?undefined:()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
                       title={satOpen?'Modifier/fermer ce samedi':'Ouvrir ce samedi'}
                       style={{
                         width:16,height:16,borderRadius:'50%',cursor:'pointer',
@@ -1581,7 +1588,7 @@ function App(){
                         cursor:isSat?'default':'pointer',userSelect:'none',
                         transition:'background .15s',
                       }}
-                      onClick={isSat?undefined:()=>toggleRegime(machine,date)}
+                      onClick={(isSat||READONLY)?undefined:()=>toggleRegime(machine,date)}
                       title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}
                     >
                       <span style={{
@@ -1599,7 +1606,7 @@ function App(){
                 {b1.map((band,bi)=>{
                   if(band.special){
                     return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
-                      onClick={()=>setModal({type:'edit',data:{...band.row}})}
+                      onClick={READONLY?undefined:()=>setModal({type:'edit',data:{...band.row}})}
                     >
                       <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
                     </div>;
@@ -1617,15 +1624,15 @@ function App(){
                       borderRight:span>1?'1px solid rgba(0,0,0,.08)':'1px solid rgba(0,0,0,.08)',
                       borderRadius:'4px 4px 0 0',
                       padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
-                      cursor:'grab',
+                      cursor:READONLY?'default':'grab',
                       
                       backgroundImage:(isDone||band.bold)?'none':`repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px),linear-gradient(${color},${color})`,
                       zIndex:1,
                     }}
-                      draggable={!resizeSrc} onDragStart={e=>onDS(e,band.fr)}
-                      onDragOver={e=>onDO(e,k)} onDragLeave={onDL}
-                      onDrop={e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
-                      onClick={()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
+                      draggable={!READONLY&&!resizeSrc} onDragStart={READONLY?undefined:e=>onDS(e,band.fr)}
+                      onDragOver={READONLY?undefined:e=>onDO(e,k)} onDragLeave={READONLY?undefined:onDL}
+                      onDrop={READONLY?undefined:e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
+                      onClick={READONLY?undefined:()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
                       title={[
                         'OF : '+(band.of_number||'—'),
                         band.designation||'',
@@ -1648,7 +1655,7 @@ function App(){
                       </>);})()}
                       {dragOver===k&&<div style={{position:'absolute',inset:0,border:'2px solid #8a6a20',borderRadius:'inherit',pointerEvents:'none'}}/>}
                       {/* Resize handle — right edge */}
-                      <div onMouseDown={e=>onResizeStart(e,band,1,machine)}
+                      <div onMouseDown={READONLY?undefined:e=>onResizeStart(e,band,1,machine)}
                         style={{position:'absolute',top:0,right:0,width:6,height:'100%',cursor:'ew-resize',zIndex:4,
                           background:'rgba(0,0,0,.0)'}}
                         onClick={e=>e.stopPropagation()}/>
@@ -1696,7 +1703,7 @@ function App(){
                         cursor:'pointer',position:'relative',
                         display:'flex',alignItems:'center',justifyContent:'center',
                       }}
-                        onClick={()=>openClosure(machine,date)}
+                        onClick={READONLY?undefined:()=>openClosure(machine,date)}
                         title={`Machine fermée le ${date} — cliquer pour rouvrir`}
                       >
                         <span style={{fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',fontWeight:700,background:'rgba(255,255,255,.7)',padding:'1px 5px',borderRadius:3}}>🔒 FERMÉ</span>
@@ -1709,11 +1716,11 @@ function App(){
                       background:dragOver===k?'#edf5e0':date===today?'rgba(255,215,0,0.06)':isM?'#fafaf8':'#f5f5f2',
                       borderBottom:'1px solid rgba(0,0,0,.04)',
                       borderRight:isM?'none':'1px solid #dddbd3',
-                      cursor:'pointer',position:'relative'
+                      cursor:READONLY?'default':'pointer',position:'relative'
                     }}
-                      onDragOver={e=>onDO(e,k)} onDragLeave={onDL}
-                      onDrop={e=>onDrop(e,machine,date,hd,1)}
-                      onClick={()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
+                      onDragOver={READONLY?undefined:e=>onDO(e,k)} onDragLeave={READONLY?undefined:onDL}
+                      onDrop={READONLY?undefined:e=>onDrop(e,machine,date,hd,1)}
+                      onClick={READONLY?undefined:()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
                     />
                   );
                 })}
@@ -1789,7 +1796,7 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
 
   return(
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:100}}>
-      <div style={{background:'#fff',borderRadius:10,padding:24,width:500,maxWidth:'95vw',maxHeight:'92vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.25)'}}>
+      <div style={{background:'#fff',borderRadius:10,padding:24,width:500,maxWidth:'95vw',maxHeight:'92vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.25)'}} onSubmit={e=>e.preventDefault()}><form autoComplete="off" style={{display:'contents'}}>
         <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,color:'#8a6a20',letterSpacing:1,marginBottom:20,textTransform:'uppercase'}}>
           {isEdit?'✏ Modifier l\'OF':'+ Nouvel OF'}
         </div>
@@ -2011,7 +2018,7 @@ function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dat
             await onSave(savedForm,hdCount,modal.data,(isEdit&&newDur!==curDuration)?newDur:undefined);
           }}>{isEdit?'Enregistrer':'Ajouter'}</button>
         </div>
-      </div>
+      </form></div>
     </div>
   );
 }
