@@ -93,6 +93,14 @@ var MACHINE_COLORS={
   'PELLICULAGE':{bg:'#2a6abf', text:'#ffffff'},
   'SERIGRAPHIE':{bg:'#1a1916', text:'#ffffff'},
 };
+// Lignes "opérateur seul" affichées en bas du planning (affectations hors machine)
+var VIRTUAL_ROWS=[
+  {key:'MANUTENTION', label:'MANUTENTION', bg:'#e8e8e8', text:'#333'},
+  {key:'BUREAU',      label:'BUREAU',      bg:'#e8e8e8', text:'#333'},
+  {key:'ABSENT_1',    label:'ABSENT',      bg:'#f4dcdc', text:'#7a3030'},
+  {key:'ABSENT_2',    label:'ABSENT',      bg:'#f4dcdc', text:'#7a3030'},
+  {key:'ABSENT_3',    label:'ABSENT',      bg:'#f4dcdc', text:'#7a3030'},
+];
 var DAY=['Dim','Lun','Mar','Mer','Jeu','Ven','Sam'];
 var MON=['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'];
 var PAL=['#fde8c8','#fad4b0','#fce4e4','#ffd4e8','#f0d4f8','#d8e8ff','#cce0ff','#c4eaf5','#c4f0e8','#d0f0cc','#e4f5c4','#f8f0bc','#ffe8b0','#ffe0c4','#ecd8ff','#d8f0ff','#ccffe4','#fff4cc','#ffe4e4','#e4e4ff','#f5ddc8','#d4f0d4','#ffd8f0','#d8d8ff','#f0f8d4'];
@@ -102,8 +110,25 @@ var LW=148; // label width px
 var HDW=50; // half-day column width px  
 var RH=67;  // row height px
 var RGH=16; // regime row height
+var ROH=22; // operator row height
+var GTH=4;  // gutter row height (machine separator)
 var HDR=56; // date header height px
 var WKH=14; // week bandeau height px
+
+// Palette 12 couleurs pour opérateurs (mélange saturé + pastel pour variété)
+var OP_PALETTE=['#e74c3c','#e67e22','#f1c40f','#2ecc71','#1abc9c','#3498db','#9b59b6','#e91e63','#795548','#607d8b','#ff9800','#4caf50'];
+
+// Calcule si le texte doit être blanc ou noir selon luminance du fond (WCAG)
+function textOnColor(hex){
+  if(!hex) return '#000';
+  var h=hex.replace('#','');
+  if(h.length===3) h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  var r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);
+  // Relative luminance per WCAG
+  var srgb=[r,g,b].map(function(v){v/=255;return v<=0.03928?v/12.92:Math.pow((v+0.055)/1.055,2.4);});
+  var L=0.2126*srgb[0]+0.7152*srgb[1]+0.0722*srgb[2];
+  return L>0.5?'#000':'#fff';
+}
 
 function getISOWeek(d){
   var t=new Date(d.getTime());
@@ -295,6 +320,9 @@ function App(){
   const [satConfigs,setSatConfigs]=useState({});
   const [closures,setClosures]=useState({}); // key: machine|date → true
   const [clients,setClients]=useState([]);
+  const [operators,setOperators]=useState([]); // [{id,nom,abrev,color,archived}]
+  const [opAssign,setOpAssign]=useState({}); // key: machine|date|half_day → operator_id
+  const [showOperators,setShowOperators]=useState(false);
   const [satModal,setSatModal]=useState(null); // {date, machines:[]}
   const [dates,setDates]=useState([]);
   const [loading,setLoading]=useState(true);
@@ -324,14 +352,20 @@ function App(){
     // Rechargement léger après mutations (planning + régimes seulement)
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
-      const [data,regData,closureData]=await Promise.all([
+      const [data,regData,closureData,opData,opAssignData]=await Promise.all([
         sb('planning?order=date,machine,slot,half_day&select=*'),
         sb('machine_regime?select=*'),
         sb('machine_closure?select=*'),
+        sb('operators?select=*'),
+        sb('operator_assignments?select=*'),
       ]);
       const rm={};
       (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
       setRegimes(rm);
+      setOperators(opData||[]);
+      const oa={};
+      (opAssignData||[]).forEach(r=>{oa[r.machine+'|'+r.date+'|'+r.half_day]=r.operator_id;});
+      setOpAssign(oa);
       const cl={};
       (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
       setClosures(cl);
@@ -359,12 +393,14 @@ function App(){
     // Chargement complet (initial + auto-sync + après changement satConfig/clients)
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
-      const [data,cliData,regData,satData,closureData]=await Promise.all([
+      const [data,cliData,regData,satData,closureData,opData,opAssignData]=await Promise.all([
         sb('planning?order=date,machine,slot,half_day&select=*'),
         sb('clients?order=nom&select=nom'),
         sb('machine_regime?select=*'),
         sb('saturday_config?select=*'),
         sb('machine_closure?select=*'),
+        sb('operators?select=*'),
+        sb('operator_assignments?select=*'),
       ]);
       const sc={};
       (satData||[]).forEach(r=>{sc[r.date]=r.machines||[];});
@@ -373,6 +409,10 @@ function App(){
       (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
       setClosures(cl);
       setClients((cliData||[]).map(c=>c.nom));
+      setOperators(opData||[]);
+      const oa={};
+      (opAssignData||[]).forEach(r=>{oa[r.machine+'|'+r.date+'|'+r.half_day]=r.operator_id;});
+      setOpAssign(oa);
       const rm={};
       (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
       setRegimes(rm);
@@ -1329,6 +1369,62 @@ function App(){
     }finally{busyRef.current=false;}
     loadPlanning();
   }
+
+  // Assign un opérateur sur un slot (machine|date|half_day).
+  // - Si le slot cliqué est LUN matin (dow=1, hd=1) → propagation lundi→vendredi (10 slots)
+  // - Sinon → modification individuelle du seul slot cliqué
+  async function setOperatorAssignment(machine, date, halfDay, operatorId){
+    const d=pd(date);
+    const dow=d.getDay(); // 0=dim, 1=lun, …, 6=sam
+    const isMondayMorning=(dow===1 && halfDay===1);
+
+    let keys=[];
+    if(isMondayMorning){
+      // Propagation : lun→ven, matin et AM (10 slots)
+      const targetDates=[];
+      for(let i=0;i<5;i++){
+        const dt=new Date(d); dt.setDate(d.getDate()+i);
+        targetDates.push(fd(dt));
+      }
+      targetDates.forEach(td=>{
+        [1,2].forEach(hd=>{ keys.push({machine,date:td,half_day:hd}); });
+      });
+    } else {
+      // Slot unique
+      keys.push({machine,date,half_day:halfDay});
+    }
+
+    // Optimistic UI
+    const newAssign={...opAssign};
+    keys.forEach(k=>{
+      const kk=k.machine+'|'+k.date+'|'+k.half_day;
+      if(operatorId==null) delete newAssign[kk];
+      else newAssign[kk]=operatorId;
+    });
+    setOpAssign(newAssign);
+
+    busyRef.current=true;
+    try{
+      // DELETE existant pour ces clés (ignorer si rien à supprimer)
+      for(const k of keys){
+        try{
+          await sb('operator_assignments?machine=eq.'+encodeURIComponent(k.machine)+'&date=eq.'+encodeURIComponent(k.date)+'&half_day=eq.'+k.half_day,
+            {method:'DELETE',prefer:'return=minimal'});
+        }catch(e){ console.warn('op_assign DELETE warn',e); }
+      }
+      if(operatorId!=null){
+        const payload=keys.map(k=>({machine:k.machine,date:k.date,half_day:k.half_day,operator_id:operatorId}));
+        try{
+          await sb('operator_assignments',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+        }catch(e){
+          console.error('op_assign INSERT error',e);
+          showToast('Erreur opérateur: '+e.message);
+          loadPlanning();
+          return;
+        }
+      }
+    }finally{busyRef.current=false;}
+  }
   window._regimes=regimes; // expose for EditModal
   const today=fd(new Date());
   const base={machine:'PFC',date:today,half_day:1,slot:1,of_number:'',client:'',designation:'',mac:'',qte:'',format:'',depart:'',conducteur:'',bold:false};
@@ -1343,7 +1439,7 @@ function App(){
   const nSC=filteredSubCols.length;
   // grid: label col + 2 sub-cols per day
   const gTC=LW+'px repeat('+nSC+', '+hdw+'px)';
-  const gTR=WKH+'px '+HDR+'px '+MACHINES.map(()=>RGH+'px '+RH+'px').join(' ');
+  const gTR=WKH+'px '+HDR+'px '+MACHINES.map(()=>RGH+'px '+ROH+'px '+RH+'px '+GTH+'px').join(' ')+' '+VIRTUAL_ROWS.map(()=>ROH+'px '+GTH+'px').join(' ');
 
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden'}}>
@@ -1359,6 +1455,7 @@ function App(){
           {sat&&<span style={{background:'#0d3030',color:'#7dd',padding:'2px 8px',borderRadius:10,fontSize:10}}>Sam. ouvert</span>}
           <button onClick={()=>setShowSet(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>⚙ Paramètres</button>
           <button onClick={()=>setShowClients(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>👥 Clients</button>
+          <button onClick={()=>setShowOperators(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>🧑‍🏭 Personnes</button>
         </div>
       </div>
 
@@ -1427,7 +1524,7 @@ function App(){
             const todayIdx=filteredDates.indexOf(today);
             if(todayIdx<0) return null;
             const left=LW+todayIdx*2*hdw;
-            const totalRows=2+MACHINES.length*2;
+            const totalRows=2+MACHINES.length*4+VIRTUAL_ROWS.length*2;
             return(
               <div style={{
                 position:'absolute',top:0,bottom:0,
@@ -1467,8 +1564,8 @@ function App(){
                   borderRight:'1px solid #2a2a2a',
                   display:'flex',alignItems:'center',justifyContent:'center',
                 }}>
-                  <span style={{fontSize:9,fontWeight:700,fontFamily:'IBM Plex Mono,monospace',color:'#2a2a1a',letterSpacing:1}}>
-                    S{w.wk}
+                  <span style={{fontSize:12,fontWeight:800,fontFamily:'IBM Plex Mono,monospace',color:'#2a2a1a',letterSpacing:1}}>
+                    S {w.wk}
                   </span>
                 </div>
               );
@@ -1551,7 +1648,7 @@ function App(){
 
           {/* MACHINE ROWS */}
           {MACHINES.map((machine,mi)=>{
-            const rReg=3+mi*2, r1=4+mi*2;
+            const rReg=3+mi*4, rOp=4+mi*4, r1=5+mi*4;
             const dMode=getModeForDate(sets,machine,today);
             const b1=bandsPerMachine[machine]||[];
             const mc=MACHINE_COLORS[machine]||{bg:'#fff',text:'#1a1916'};
@@ -1560,13 +1657,13 @@ function App(){
 
             return(
               <React.Fragment key={machine}>
-                {/* LABEL spans both rows */}
+                {/* LABEL spans all 3 rows (regime + operator + slot) */}
                 <div style={{
                   gridRow:rReg+'/'+(r1+1),gridColumn:1,
                   position:'sticky',left:0,zIndex:5,
                   background:mc.bg,borderRight:'2px solid #b8b5aa',borderBottom:'2px solid #ccc',
                   padding:'0 10px',display:'flex',flexDirection:'column',justifyContent:'center',
-                  height:RGH+RH
+                  height:RGH+ROH+RH
                 }}>
                   <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,fontWeight:700,color:mc.text}}>{machine}</div>
                 </div>
@@ -1582,8 +1679,8 @@ function App(){
                     <div key={'reg'+date}
                       style={{
                         gridRow:rReg, gridColumn:colStart+'/'+(colStart+2),
-                        background:isSatOpen?'#fff3c0':is2x8?'#d4eaff':'transparent',
-                        borderBottom:isSatOpen?'1px solid #e0c040':is2x8?'1px solid #90c4f0':'1px solid #e8e8e0',
+                        background:isSatOpen?'#fff3c0':is2x8?'#1e5fa8':'transparent',
+                        borderBottom:isSatOpen?'1px solid #e0c040':is2x8?'1px solid #14457d':'1px solid #e8e8e0',
                         borderRight:'1px solid #e0e0d8',
                         display:'flex',alignItems:'center',justifyContent:'center',
                         cursor:isSat?'default':'pointer',userSelect:'none',
@@ -1593,12 +1690,74 @@ function App(){
                       title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}
                     >
                       <span style={{
-                        fontSize:9,fontWeight:700,
+                        fontSize:isSatOpen||is2x8?12:9,
                         fontFamily:'IBM Plex Mono,monospace',
                         letterSpacing:.5,
-                        color:isSatOpen?'#7a6000':is2x8?'#104070':'#d8d8d0',
-                        fontWeight:isSatOpen?700:400,
+                        color:isSatOpen?'#7a6000':is2x8?'#ffffff':'#d8d8d0',
+                        fontWeight:isSatOpen||is2x8?800:400,
                       }}>{isSatOpen?'Sam':is2x8?'2×8':'1×8'}</span>
+                    </div>
+                  );
+                })}
+
+                {/* OPERATOR ROW — one cell per half-day slot */}
+                {filteredSubCols.map((sc,sci)=>{
+                  const k=machine+'|'+sc.date+'|'+sc.hd;
+                  const assignedId=opAssign[k];
+                  const op=assignedId?operators.find(o=>o.id===assignedId):null;
+                  const bg=op?op.color:'transparent';
+                  const fg=op?textOnColor(op.color):'#888';
+                  // Liste dispo : non-archivés
+                  const availOps=operators.filter(o=>!o.archived);
+                  return(
+                    <div key={'op'+sc.date+sc.hd}
+                      style={{
+                        gridRow:rOp, gridColumn:sci+2,
+                        background:bg,
+                        borderBottom:'1px solid #d8d8d0',
+                        borderRight:'1px solid #e8e5e2',
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        position:'relative',
+                        padding:0,
+                      }}
+                      title={op?op.nom:'Aucun opérateur'}
+                    >
+                      <select
+                        value={assignedId||''}
+                        disabled={READONLY}
+                        onChange={e=>{
+                          const v=e.target.value;
+                          setOperatorAssignment(machine,sc.date,sc.hd,v===''?null:v);
+                        }}
+                        style={{
+                          width:'100%',height:'100%',
+                          border:'none',outline:'none',
+                          background:'transparent',
+                          color:fg,
+                          fontFamily:'IBM Plex Mono,monospace',
+                          fontSize:11,fontWeight:700,letterSpacing:.3,
+                          textAlign:'center',textAlignLast:'center',
+                          cursor:READONLY?'default':'pointer',
+                          appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
+                          padding:0,
+                        }}
+                      >
+                        <option value="" style={{background:'#fff',color:'#888'}}>—</option>
+                        {availOps.map(o=>(
+                          <option key={o.id} value={o.id}
+                            style={{background:o.color,color:textOnColor(o.color),fontWeight:700}}>
+                            {o.abrev}
+                          </option>
+                        ))}
+                      </select>
+                      {op&&(
+                        <span style={{
+                          position:'absolute',pointerEvents:'none',
+                          fontFamily:'IBM Plex Mono,monospace',
+                          fontSize:11,fontWeight:800,letterSpacing:.3,
+                          color:fg,
+                        }}>{op.abrev}</span>
+                      )}
                     </div>
                   );
                 })}
@@ -1726,6 +1885,99 @@ function App(){
                   );
                 })}
 
+                {/* GUTTER row — bande blanche séparatrice entre machines */}
+                <div style={{
+                  gridRow:r1+1, gridColumn:'1/'+(nSC+2),
+                  background:'#fff',
+                  position:'sticky',left:0,
+                }}/>
+
+              </React.Fragment>
+            );
+          })}
+
+          {/* VIRTUAL ROWS — opérateur seul (Manutention, Bureau, Absent×3) */}
+          {VIRTUAL_ROWS.map((vr,vi)=>{
+            const baseRow=3+MACHINES.length*4;
+            const rV=baseRow+vi*2;
+            const rGut=rV+1;
+            return(
+              <React.Fragment key={'vr_'+vr.key}>
+                {/* LABEL */}
+                <div style={{
+                  gridRow:rV, gridColumn:1,
+                  position:'sticky',left:0,zIndex:5,
+                  background:vr.bg,borderRight:'2px solid #b8b5aa',
+                  padding:'0 10px',display:'flex',alignItems:'center',
+                  height:ROH,
+                }}>
+                  <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,fontWeight:700,color:vr.text,letterSpacing:.5}}>{vr.label}</div>
+                </div>
+
+                {/* OPERATOR CELLS — dropdown par demi-journée */}
+                {filteredSubCols.map((sc,sci)=>{
+                  const k=vr.key+'|'+sc.date+'|'+sc.hd;
+                  const assignedId=opAssign[k];
+                  const op=assignedId?operators.find(o=>o.id===assignedId):null;
+                  const bg=op?op.color:'transparent';
+                  const fg=op?textOnColor(op.color):'#888';
+                  const availOps=operators.filter(o=>!o.archived);
+                  return(
+                    <div key={'vop'+vr.key+sc.date+sc.hd}
+                      style={{
+                        gridRow:rV, gridColumn:sci+2,
+                        background:bg,
+                        borderBottom:'1px solid #d8d8d0',
+                        borderRight:'1px solid #e8e5e2',
+                        display:'flex',alignItems:'center',justifyContent:'center',
+                        position:'relative',padding:0,
+                      }}
+                      title={op?op.nom:'Aucun opérateur'}
+                    >
+                      <select
+                        value={assignedId||''}
+                        disabled={READONLY}
+                        onChange={e=>{
+                          const v=e.target.value;
+                          setOperatorAssignment(vr.key,sc.date,sc.hd,v===''?null:v);
+                        }}
+                        style={{
+                          width:'100%',height:'100%',
+                          border:'none',outline:'none',
+                          background:'transparent',color:fg,
+                          fontFamily:'IBM Plex Mono,monospace',
+                          fontSize:11,fontWeight:700,letterSpacing:.3,
+                          textAlign:'center',textAlignLast:'center',
+                          cursor:READONLY?'default':'pointer',
+                          appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
+                          padding:0,
+                        }}
+                      >
+                        <option value="" style={{background:'#fff',color:'#888'}}>—</option>
+                        {availOps.map(o=>(
+                          <option key={o.id} value={o.id}
+                            style={{background:o.color,color:textOnColor(o.color),fontWeight:700}}>
+                            {o.abrev}
+                          </option>
+                        ))}
+                      </select>
+                      {op&&(
+                        <span style={{
+                          position:'absolute',pointerEvents:'none',
+                          fontFamily:'IBM Plex Mono,monospace',
+                          fontSize:11,fontWeight:800,letterSpacing:.3,
+                          color:fg,
+                        }}>{op.abrev}</span>
+                      )}
+                    </div>
+                  );
+                })}
+
+                {/* GUTTER */}
+                <div style={{
+                  gridRow:rGut, gridColumn:'1/'+(nSC+2),
+                  background:'#fff',position:'sticky',left:0,
+                }}/>
               </React.Fragment>
             );
           })}
@@ -1769,6 +2021,7 @@ function App(){
       {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={rows} subCols={subCols} dates={dates} sets={sets} sat={sat} clients={clients} onCloseMachine={saveClosure}/>}
       {showSet&&<Settings sets={sets} onChange={upd} onClose={()=>setShowSet(false)}/>}
       {showClients&&<ClientsManager onClose={()=>{setShowClients(false);load();}}/>}
+      {showOperators&&<OperatorsManager onClose={()=>{setShowOperators(false);load();}}/>}
       {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
         onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
       {toast&&<div className="toast">{toast}</div>}
@@ -2212,6 +2465,194 @@ function ClientsManager({onClose}){
                 </button>
               </div>
             ))
+          }
+        </div>
+
+        <button className="btn" style={{marginTop:16}} onClick={onClose}>Fermer</button>
+      </div>
+    </div>
+  );
+}
+
+function OperatorsManager({onClose}){
+  const [list,setList]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [msg,setMsg]=useState('');
+  // Form state
+  const [newNom,setNewNom]=useState('');
+  const [newAbrev,setNewAbrev]=useState('');
+  const [newColor,setNewColor]=useState(OP_PALETTE[0]);
+  // Edit state : { id, nom, abrev, color }
+  const [edit,setEdit]=useState(null);
+
+  async function load(){
+    setLoading(true);
+    const data=await sb('operators?order=nom&select=*');
+    setList(data||[]);
+    setLoading(false);
+  }
+  useEffect(()=>{load();},[]);
+
+  async function add(){
+    const nom=newNom.trim();
+    const abrev=newAbrev.trim().toUpperCase().slice(0,2);
+    if(!nom||!abrev){setMsg('Nom et abrév. requis');setTimeout(()=>setMsg(''),2500);return;}
+    if(nom.length>30){setMsg('Nom ≤ 30 caractères');setTimeout(()=>setMsg(''),2500);return;}
+    try{
+      await sb('operators',{method:'POST',body:JSON.stringify({nom,abrev,color:newColor,archived:false}),prefer:'return=minimal'});
+      setNewNom('');setNewAbrev('');setNewColor(OP_PALETTE[0]);
+      setMsg('✓ Ajouté');setTimeout(()=>setMsg(''),2000);load();
+    }catch(e){setMsg('Erreur: '+e.message);setTimeout(()=>setMsg(''),3500);}
+  }
+
+  async function saveEdit(){
+    if(!edit) return;
+    const nom=edit.nom.trim();
+    const abrev=edit.abrev.trim().toUpperCase().slice(0,2);
+    if(!nom||!abrev){setMsg('Nom et abrév. requis');setTimeout(()=>setMsg(''),2500);return;}
+    if(nom.length>30){setMsg('Nom ≤ 30 caractères');setTimeout(()=>setMsg(''),2500);return;}
+    try{
+      await sb('operators?id=eq.'+edit.id,{method:'PATCH',body:JSON.stringify({nom,abrev,color:edit.color}),prefer:'return=minimal'});
+      setEdit(null);setMsg('✓ Modifié');setTimeout(()=>setMsg(''),2000);load();
+    }catch(e){setMsg('Erreur: '+e.message);setTimeout(()=>setMsg(''),3500);}
+  }
+
+  async function toggleArchive(o){
+    const next=!o.archived;
+    const verb=next?'Archiver':'Désarchiver';
+    if(!confirm(verb+' "'+o.nom+'" ? '+(next?'Les affectations historiques restent conservées.':'Il redeviendra disponible dans les listes déroulantes.'))) return;
+    try{
+      await sb('operators?id=eq.'+o.id,{method:'PATCH',body:JSON.stringify({archived:next}),prefer:'return=minimal'});
+      setMsg('✓ '+(next?'Archivé':'Désarchivé'));setTimeout(()=>setMsg(''),2000);load();
+    }catch(e){setMsg('Erreur: '+e.message);setTimeout(()=>setMsg(''),3500);}
+  }
+
+  // Sort: non-archivés d'abord (alphabétique), puis archivés
+  const sorted=[...list].sort((a,b)=>{
+    if(!!a.archived!==!!b.archived) return a.archived?1:-1;
+    return (a.nom||'').localeCompare(b.nom||'');
+  });
+
+  function ColorPalette({value,onChange}){
+    return(
+      <div style={{display:'flex',flexWrap:'wrap',gap:5}}>
+        {OP_PALETTE.map(c=>(
+          <button key={c} type="button" onClick={()=>onChange(c)}
+            style={{
+              width:26,height:26,borderRadius:5,cursor:'pointer',
+              background:c,
+              border:value===c?'2px solid #1a1916':'1px solid rgba(0,0,0,.15)',
+              boxShadow:value===c?'0 0 0 2px #c9a84c':'none',
+              padding:0,
+            }}
+            title={c}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'flex-start',justifyContent:'flex-end',zIndex:110}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',width:520,height:'100vh',overflowY:'auto',boxShadow:'-10px 0 40px rgba(0,0,0,.2)',padding:28,display:'flex',flexDirection:'column'}}>
+        <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#8a6a20',letterSpacing:1,marginBottom:20,textTransform:'uppercase'}}>
+          🧑‍🏭 Gestion des personnes
+        </div>
+
+        {/* Add new */}
+        <div style={{border:'1px solid #eeede8',borderRadius:6,padding:14,marginBottom:16,background:'#fafaf7'}}>
+          <div style={{fontSize:11,fontWeight:600,color:'#666',marginBottom:8,letterSpacing:.5,textTransform:'uppercase'}}>Nouvelle personne</div>
+          <div style={{display:'flex',gap:8,marginBottom:8}}>
+            <input className="inp" placeholder="Nom (30 car. max)" value={newNom} maxLength={30}
+              onChange={e=>setNewNom(e.target.value)} style={{flex:1}}/>
+            <input className="inp" placeholder="AB" value={newAbrev} maxLength={2}
+              onChange={e=>setNewAbrev(e.target.value.toUpperCase())} style={{width:60,textAlign:'center',fontFamily:'IBM Plex Mono,monospace',fontWeight:700}}/>
+          </div>
+          <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:10}}>
+            <div style={{fontSize:11,color:'#666'}}>Couleur :</div>
+            <ColorPalette value={newColor} onChange={setNewColor}/>
+          </div>
+          {/* Preview */}
+          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
+            <div style={{fontSize:11,color:'#888'}}>Aperçu :</div>
+            <div style={{
+              display:'inline-flex',alignItems:'center',justifyContent:'center',
+              minWidth:36,height:24,padding:'0 8px',borderRadius:4,
+              background:newColor,color:textOnColor(newColor),
+              fontFamily:'IBM Plex Mono,monospace',fontSize:11,fontWeight:800,letterSpacing:.3,
+            }}>{newAbrev||'??'}</div>
+          </div>
+          <button className="btn btn-primary" onClick={add}>Ajouter</button>
+        </div>
+        {msg&&<div style={{fontSize:12,color:msg.startsWith('✓')?'#2d6a4f':'#c00',marginBottom:10}}>{msg}</div>}
+
+        <div style={{fontSize:11,color:'#aaa',marginBottom:8}}>
+          {sorted.filter(o=>!o.archived).length} active{sorted.filter(o=>!o.archived).length>1?'s':''}
+          {sorted.filter(o=>o.archived).length>0&&' · '+sorted.filter(o=>o.archived).length+' archivée'+(sorted.filter(o=>o.archived).length>1?'s':'')}
+        </div>
+
+        {/* Header cols */}
+        <div style={{display:'flex',alignItems:'center',gap:8,padding:'5px 10px',fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',letterSpacing:.5,textTransform:'uppercase'}}>
+          <span style={{flex:1}}>Nom</span>
+          <span style={{width:60,textAlign:'center'}}>Abrév.</span>
+          <span style={{width:120,textAlign:'center'}}>Couleur</span>
+          <span style={{width:80}}></span>
+        </div>
+
+        {/* List */}
+        <div style={{flex:1,overflowY:'auto'}}>
+          {loading ? <div style={{color:'#aaa',fontSize:13}}>Chargement…</div> :
+            sorted.map(o=>{
+              const isEdit=edit&&edit.id===o.id;
+              if(isEdit){
+                return(
+                  <div key={o.id} style={{padding:12,borderRadius:5,marginBottom:4,background:'#fff8e0',border:'1px solid #c9a84c'}}>
+                    <div style={{display:'flex',gap:8,marginBottom:8}}>
+                      <input className="inp" value={edit.nom} maxLength={30}
+                        onChange={e=>setEdit({...edit,nom:e.target.value})} style={{flex:1}}/>
+                      <input className="inp" value={edit.abrev} maxLength={2}
+                        onChange={e=>setEdit({...edit,abrev:e.target.value.toUpperCase()})}
+                        style={{width:60,textAlign:'center',fontFamily:'IBM Plex Mono,monospace',fontWeight:700}}/>
+                    </div>
+                    <div style={{marginBottom:10}}>
+                      <ColorPalette value={edit.color} onChange={c=>setEdit({...edit,color:c})}/>
+                    </div>
+                    <div style={{display:'flex',gap:8}}>
+                      <button className="btn btn-primary" onClick={saveEdit}>Enregistrer</button>
+                      <button className="btn" onClick={()=>setEdit(null)}>Annuler</button>
+                    </div>
+                  </div>
+                );
+              }
+              return(
+                <div key={o.id} style={{
+                  display:'flex',alignItems:'center',gap:8,padding:'7px 10px',borderRadius:5,marginBottom:3,
+                  background:o.archived?'#f4f4f0':'#f9f9f7',
+                  border:'1px solid '+(o.archived?'#e8e8e0':'#eeede8'),
+                  opacity:o.archived?.6:1,
+                }}>
+                  <span style={{flex:1,fontSize:13,textDecoration:o.archived?'line-through':'none'}}>{o.nom}</span>
+                  <span style={{
+                    width:60,textAlign:'center',
+                    fontFamily:'IBM Plex Mono,monospace',fontSize:12,fontWeight:800,letterSpacing:.3,
+                    padding:'3px 0',borderRadius:4,
+                    background:o.color,color:textOnColor(o.color||'#ccc'),
+                  }}>{o.abrev}</span>
+                  <span style={{
+                    width:120,textAlign:'center',fontSize:10,color:'#888',fontFamily:'IBM Plex Mono,monospace',
+                  }}>{o.color}</span>
+                  <span style={{display:'flex',gap:4,width:80,justifyContent:'flex-end'}}>
+                    <button onClick={()=>setEdit({id:o.id,nom:o.nom,abrev:o.abrev,color:o.color})}
+                      style={{padding:'2px 7px',borderRadius:4,border:'1px solid #dcd',background:'#fff',color:'#555',fontSize:11,cursor:'pointer'}}
+                      title="Modifier">✎</button>
+                    <button onClick={()=>toggleArchive(o)}
+                      style={{padding:'2px 7px',borderRadius:4,border:'1px solid #ddc',background:'#fffbf0',color:'#8a6a20',fontSize:11,cursor:'pointer'}}
+                      title={o.archived?'Désarchiver':'Archiver'}>{o.archived?'↺':'📦'}</button>
+                  </span>
+                </div>
+              );
+            })
           }
         </div>
 
