@@ -140,11 +140,13 @@ function getISOWeek(d){
 
 function hc(s){if(!s)return'#f0efe9';var h=0;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))>>>0;return PAL[h%PAL.length];}
 var _dcCache={};
+var _dcCacheSize=0;
 function getDeadlineColor(depart, ofEndDateStr, sat){
   var key=depart+'|'+ofEndDateStr;
   if(_dcCache[key]!==undefined) return _dcCache[key]||null;
   var result=_getDeadlineColor(depart,ofEndDateStr,sat);
   _dcCache[key]=result||false;
+  if(++_dcCacheSize>2000){_dcCache={};_dcCacheSize=0;} // purge si trop grand
   return result;
 }
 function _getDeadlineColor(depart, ofEndDateStr, sat){
@@ -202,7 +204,8 @@ function encodeColor(colorOverride,obs,done){
   return done?'DONE|'+base:base;
 }
 var _pdCache={};
-function pd(s){if(_pdCache[s])return new Date(_pdCache[s]);var p=s.split('/');var d=new Date(2000+parseInt(p[2]),parseInt(p[1])-1,parseInt(p[0]));_pdCache[s]=d.getTime();return d;}
+var _pdCacheSize=0;
+function pd(s){if(_pdCache[s])return new Date(_pdCache[s]);var p=s.split('/');var d=new Date(2000+parseInt(p[2]),parseInt(p[1])-1,parseInt(p[0]));_pdCache[s]=d.getTime();if(++_pdCacheSize>3000){_pdCache={};_pdCacheSize=0;}return d;}
 function fd(d){return String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getFullYear()).slice(2);}
 function isWD(d,sat){var w=d.getDay();return w!==0&&(sat||w!==6);}
 
@@ -253,11 +256,10 @@ function planHalfDays(halfDays, startDate, startHD, sets, machine, sat, regimes,
 
 async function sb(path,opts){
   opts=opts||{};
-  var r=await fetch(SB+'/rest/v1/'+path,{
-    method:opts.method||'GET',
-    headers:{'apikey':KEY,'Authorization':'Bearer '+KEY,'Content-Type':'application/json','Prefer':opts.prefer||'return=representation'},
-    body:opts.body
-  });
+  var method=opts.method||'GET';
+  var headers={'apikey':KEY,'Authorization':'Bearer '+KEY,'Prefer':opts.prefer||'return=representation'};
+  if(opts.body) headers['Content-Type']='application/json';
+  var r=await fetch(SB+'/rest/v1/'+path,{method,headers,body:opts.body});
   if(!r.ok)throw new Error(await r.text());
   var t=await r.text();return t?JSON.parse(t):null;
 }
@@ -323,6 +325,9 @@ function App(){
   const [operators,setOperators]=useState([]); // [{id,nom,abrev,color,archived}]
   const [opAssign,setOpAssign]=useState({}); // key: machine|date|half_day → operator_id
   const [showOperators,setShowOperators]=useState(false);
+  const [showBackups,setShowBackups]=useState(false);
+  // previewData: {rows, backupId, backupDate} — mode aperçu snapshot (lecture seule)
+  const [previewData,setPreviewData]=useState(null);
   const [satModal,setSatModal]=useState(null); // {date, machines:[]}
   const [dates,setDates]=useState([]);
   const [loading,setLoading]=useState(true);
@@ -438,16 +443,92 @@ function App(){
       } else if(savedScroll!==null){
         setTimeout(()=>{if(gridRef.current) gridRef.current.scrollLeft=savedScroll;}, 30);
       }
-    }catch(e){showToast('Erreur: '+e.message);}
-    if(loading) setLoading(false); // seulement au premier chargement
+      if(loading) setLoading(false); // seulement au premier chargement
+      return r; // retourne les rows pour éviter un double-fetch au démarrage
+    }catch(e){showToast('Erreur: '+e.message);if(loading) setLoading(false);}
   }
+
+  // ─── DAILY BACKUP ─────────────────────────────────────────────────────────
+  // Crée automatiquement un snapshot quotidien au premier chargement du jour.
+  // Stocke dans Supabase table `planning_backups` (créée si besoin via upsert).
+  // Si la table n'existe pas encore, la sauvegarde est silencieusement ignorée.
+  async function createDailyBackup(planningData){
+    const dateKey=fd(new Date()); // dd/mm/yy
+    try{
+      // Vérifie si une sauvegarde existe déjà aujourd'hui
+      const existing=await sb('planning_backups?backup_date=eq.'+encodeURIComponent(dateKey)+'&select=id').catch(()=>null);
+      if(existing && existing.length>0) return; // déjà fait aujourd'hui
+      const payload={backup_date:dateKey, created_at:new Date().toISOString(), snapshot:JSON.stringify(planningData)};
+      await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'}).catch(()=>null);
+      // Purge : ne garder que les 60 derniers jours (tri par created_at ISO = tri chronologique fiable)
+      const old=await sb('planning_backups?select=id,created_at&order=created_at.asc').catch(()=>null);
+      if(old && old.length>60){
+        const toDelete=old.slice(0,old.length-60);
+        for(const b of toDelete){
+          await sb('planning_backups?id=eq.'+b.id,{method:'DELETE',prefer:'return=minimal'}).catch(()=>null);
+        }
+      }
+    }catch(e){/* silencieux — la table peut ne pas encore exister */}
+  }
+
+  async function createManualBackup(){
+    const now=new Date();
+    const dateKey=fd(now);
+    const hhmm=now.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+    // On préfixe backup_date avec "M|" pour identifier les sauvegardes manuelles
+    const labelKey='M|'+dateKey+'|'+hhmm;
+    try{
+      const data=await sb('planning?order=date,machine,slot,half_day&select=*');
+      const payload={backup_date:labelKey, created_at:now.toISOString(), snapshot:JSON.stringify(data||[])};
+      await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+      return true;
+    }catch(e){throw e;}
+  }
+
+  async function loadBackups(){
+    try{
+      const data=await sb('planning_backups?select=id,backup_date,created_at&order=created_at.desc&limit=60');
+      return data||[];
+    }catch(e){return[];}
+  }
+
+  async function restoreBackup(backupId){
+    try{
+      const data=await sb('planning_backups?id=eq.'+backupId+'&select=snapshot');
+      if(!data||data.length===0) throw new Error('Sauvegarde introuvable');
+      const snapshot=JSON.parse(data[0].snapshot);
+      // 1. Récupérer tous les ids existants puis supprimer par lots
+      const existing=await sb('planning?select=id');
+      if(existing&&existing.length>0){
+        const deleteChunkSize=200;
+        for(let i=0;i<existing.length;i+=deleteChunkSize){
+          const ids=existing.slice(i,i+deleteChunkSize).map(r=>r.id).join(',');
+          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+        }
+      }
+      // 2. Réinsérer par lots de 200 (snapshots peuvent être grands)
+      const chunkSize=200;
+      for(let i=0;i<snapshot.length;i+=chunkSize){
+        const chunk=snapshot.slice(i,i+chunkSize).map(({id,...rest})=>rest);
+        await sb('planning',{method:'POST',body:JSON.stringify(chunk),prefer:'return=minimal'});
+      }
+      return true;
+    }catch(e){throw e;}
+  }
+  // ─── END DAILY BACKUP ─────────────────────────────────────────────────────
 
   const modalOpenRef=useRef(false);
   useEffect(()=>{modalOpenRef.current=!!modal;},[modal]);
 
+  const previewDataRef=useRef(null);
+  useEffect(()=>{previewDataRef.current=previewData;},[previewData]);
+
   useEffect(()=>{
-    load();
-    const t=setInterval(()=>{ if(!busyRef.current && !modalOpenRef.current) load(); },30000);
+    load().then(planningRows=>{
+      // Snapshot quotidien automatique — réutilise les données déjà chargées
+      if(planningRows) createDailyBackup(planningRows);
+    });
+    const t=setInterval(()=>{ if(!busyRef.current && !modalOpenRef.current && !previewDataRef.current) load(); },30000);
     return()=>clearInterval(t);
   },[sat]);
 
@@ -496,16 +577,28 @@ function App(){
     return()=>window.removeEventListener('keydown',onKey);
   },[]);
 
+  // En mode aperçu snapshot, on substitue rows par previewData.rows
+  // On étend aussi dates pour couvrir les éventuelles dates du snapshot hors plage actuelle
+  const activeRows=previewData?previewData.rows:rows;
+
+  const activeDates=useMemo(()=>{
+    if(!previewData) return dates;
+    // Ajouter les dates du snapshot qui seraient hors de la plage courante
+    const extra=new Set(previewData.rows.map(r=>r.date).filter(d=>!dates.includes(d)));
+    if(extra.size===0) return dates;
+    return [...new Set([...dates,...extra])].sort((a,b)=>pd(a)-pd(b));
+  },[dates, previewData]);
+
   const lkp=useMemo(()=>{
     const m={};
-    rows.forEach(r=>{
+    activeRows.forEach(r=>{
       const hd=r.half_day||1;
       m[r.machine+'|'+r.date+'|'+hd+'|'+r.slot]=r;
     });
     return m;
-  },[rows]);
+  },[activeRows]);
 
-  const subCols=useMemo(()=>buildSubCols(dates,sat),[dates,sat]);
+  const subCols=useMemo(()=>buildSubCols(activeDates,sat),[activeDates,sat]);
 
   // Map date|hd → index pour lookups O(1)
   const subColsMap=useMemo(()=>{
@@ -624,12 +717,12 @@ function App(){
 
   // filter dates by search
   const filteredDates=useMemo(()=>{
-    if(!q)return dates;
+    if(!q)return activeDates;
     const ql=q.toLowerCase();
-    return dates.filter(d=>rows.some(r=>r.date===d&&(
+    return activeDates.filter(d=>activeRows.some(r=>r.date===d&&(
       (r.client||'').toLowerCase().includes(ql)||(r.of_number||'').toLowerCase().includes(ql)||(r.designation||'').toLowerCase().includes(ql)
     )));
-  },[dates,rows,q]);
+  },[activeDates,activeRows,q]);
 
   const filteredSubCols=useMemo(()=>buildSubCols(filteredDates,sat),[filteredDates,sat]);
 
@@ -660,6 +753,7 @@ function App(){
   async function onDrop(e,tMachine,tDate,tHD,tSlot){
     e.preventDefault();setDragOver(null);
     if(!dragSrc)return;
+    busyRef.current=true;
     const src=dragSrc; setDragSrc(null);
     // Override tDate/tHD with actual mouse position (fixes drop on own band)
     const actualCol=subColFromEvent(e);
@@ -848,6 +942,7 @@ function App(){
     }finally{busyRef.current=false;loadPlanning();}  }
 
   async function onSave(formData, halfDayCount, origData, newDurOverride){
+    busyRef.current=true;
     try{
       if(modal.type==='add'){
         const startHD=formData.half_day||1;
@@ -869,9 +964,12 @@ function App(){
         const conflictIds=new Set(rows
           .filter(r=>r.machine===formData.machine&&r.slot===formData.slot&&newMscSet.has(mscMap.get(r.date+'|'+(r.half_day||1))))
           .map(r=>r.id));
-        const toShiftC=conflictIds.size>0 ? rows.filter(r=>{
+        // Calculer conflictKeys UNE SEULE FOIS (pas dans chaque itération de filter)
+        const conflictKeys=conflictIds.size>0
+          ? new Set(rows.filter(x=>conflictIds.has(x.id)).map(x=>x.of_number+'§'+x.client+'§'+x.designation))
+          : new Set();
+        const toShiftC=conflictKeys.size>0 ? rows.filter(r=>{
           if(r.machine!==formData.machine||r.slot!==formData.slot) return false;
-          const conflictKeys=new Set(rows.filter(x=>conflictIds.has(x.id)).map(x=>x.of_number+'§'+x.client+'§'+x.designation));
           return conflictKeys.has(r.of_number+'§'+r.client+'§'+r.designation);
         }) : [];
 
@@ -933,14 +1031,17 @@ function App(){
         // Resize intégré : on utilise allOfRows déjà connu (avant reload)
         if(newDurOverride!==undefined && newDurOverride!==allOfRows.length){
           await onResize(orig.machine, formData.of_number, formData.client, formData.designation, orig.slot, newDurOverride, patchedRows);
+          busyRef.current=false;
           return;
         }
       }
       setModal(null);loadPlanning();
     }catch(e){showToast('Erreur: '+e.message);}
+    finally{busyRef.current=false;}
   }
 
   async function onDel(id){
+    busyRef.current=true;
     try{
       const clicked=rows.find(x=>x.id===id);
       if(!clicked) return;
@@ -954,6 +1055,7 @@ function App(){
       showToast('✓ Supprimé · Ctrl+Z pour annuler');setModal(null);loadPlanning();
     }
     catch(e){showToast('Erreur: '+e.message);}
+    finally{busyRef.current=false;}
   }
 
   async function onShift(machine,of_number,client,designation,slot,halfDays){
@@ -1093,25 +1195,25 @@ function App(){
       }).filter(m=>m&&m.nc!==null);
       const toShift=toShiftRows;
 
-      // ATOMIC: delete all shifted rows, reinsert at new positions, then add new OF slots
+      // ATOMIC: delete all shifted rows, bulk reinsert at new positions, bulk add new OF slots
       const actualInserted=[];
       if(toShiftRows.length>0){
         const ids=toShiftRows.map(r=>r.id).join(',');
         await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
       }
-      for(const {r,nc} of shiftMoves){
-        const {id,...rest}=r;
-        const res=await sb('planning',{method:'POST',body:JSON.stringify({...rest,date:nc.date,half_day:nc.hd}),prefer:'return=representation'});
-        if(res&&res[0]) actualInserted.push(res[0]);
+      // Bulk INSERT décalés
+      if(shiftMoves.length>0){
+        const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
+        const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
+        if(res) actualInserted.push(...res);
       }
-      for(const nc of addSlots){
-        const res=await sb('planning',{method:'POST',
-          body:JSON.stringify({machine,date:nc.date,half_day:nc.hd,slot,
-            of_number,client,designation,mac:last.mac,qte:last.qte,
-            format:last.format||'',
-            depart:last.depart,conducteur:last.conducteur,bold:last.bold}),
-          prefer:'return=representation'});
-        if(res&&res[0]) actualInserted.push(res[0]);
+      // Bulk INSERT nouveaux slots OF
+      if(addSlots.length>0){
+        const addPayload=addSlots.map(nc=>({machine,date:nc.date,half_day:nc.hd,slot,
+          of_number,client,designation,mac:last.mac,qte:last.qte,
+          format:last.format||'',depart:last.depart,conducteur:last.conducteur,bold:last.bold}));
+        const res=await sb('planning',{method:'POST',body:JSON.stringify(addPayload),prefer:'return=representation'});
+        if(res) actualInserted.push(...res);
       }
 
       const nPushed=new Set(toShiftRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation)).size;
@@ -1428,6 +1530,8 @@ function App(){
   window._regimes=regimes; // expose for EditModal
   const today=fd(new Date());
   const base={machine:'PFC',date:today,half_day:1,slot:1,of_number:'',client:'',designation:'',mac:'',qte:'',format:'',depart:'',conducteur:'',bold:false};
+  // En mode aperçu, on bloque toutes les interactions d'édition
+  const isLocked=READONLY||!!previewData;
 
   if(loading)return(
     <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',gap:12,color:'#888',fontFamily:'IBM Plex Mono,monospace'}}>
@@ -1450,22 +1554,65 @@ function App(){
           <div style={{fontSize:14,fontWeight:700,color:'#f5f4f0',marginTop:2}}>Planning Production</div>
         </div>
         <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,fontSize:11,color:'#aaa'}}>
-          <div style={{width:7,height:7,borderRadius:'50%',background:'#4faa7a',animation:'pulse 2s infinite'}}/>
-          {rows.length} entrées · auto-sync
+          <div style={{width:7,height:7,borderRadius:'50%',background:previewData?'#e67e22':'#4faa7a',animation:'pulse 2s infinite'}}/>
+          {activeRows.length} entrées · {previewData?<span style={{color:'#e67e22',fontWeight:700}}>APERÇU SNAPSHOT</span>:'auto-sync'}
           {sat&&<span style={{background:'#0d3030',color:'#7dd',padding:'2px 8px',borderRadius:10,fontSize:10}}>Sam. ouvert</span>}
           <button onClick={()=>setShowSet(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>⚙ Paramètres</button>
           <button onClick={()=>setShowClients(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>👥 Clients</button>
           <button onClick={()=>setShowOperators(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>🧑‍🏭 Personnes</button>
+          {!isLocked&&<button onClick={()=>setShowBackups(true)} title="Sauvegardes quotidiennes" style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>💾 Sauvegardes</button>}
         </div>
       </div>
+
+      {/* BANNIÈRE APERÇU SNAPSHOT */}
+      {previewData&&(
+        <div style={{
+          display:'flex',alignItems:'center',gap:16,
+          padding:'10px 20px',
+          background:'#fff3cd',borderBottom:'2px solid #e67e22',
+          flexShrink:0,zIndex:50,
+        }}>
+          <span style={{fontSize:22}}>👁</span>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:700,color:'#7d4e00',fontSize:13}}>
+              Aperçu du snapshot du {previewData.backupDate} — lecture seule
+            </div>
+            <div style={{fontSize:11,color:'#a06000',marginTop:2}}>
+              Vous consultez une version archivée du planning. Aucune modification n'est possible dans ce mode.
+            </div>
+          </div>
+          <button onClick={async()=>{
+            if(!window.confirm('Remplacer le planning actuel par cette version du '+previewData.backupDate+' ?\n\nCette action est irréversible (sauf si une sauvegarde d\'aujourd\'hui existe déjà).')) return;
+            try{
+              await restoreBackup(previewData.backupId);
+              showToast('✓ Planning restauré au '+previewData.backupDate);
+              setPreviewData(null);
+              load();
+            }catch(e){showToast('Erreur restauration : '+e.message);}
+          }} style={{
+            padding:'8px 18px',borderRadius:6,border:'none',
+            background:'#e67e22',color:'#fff',fontSize:12,fontWeight:700,
+            cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0,
+          }}>
+            ✓ Restaurer cette version
+          </button>
+          <button onClick={()=>{setPreviewData(null);}} style={{
+            padding:'8px 14px',borderRadius:6,border:'1px solid #c9a84c',
+            background:'#fff',color:'#7d4e00',fontSize:12,fontWeight:600,
+            cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0,
+          }}>
+            ✕ Annuler l'aperçu
+          </button>
+        </div>
+      )}
 
       {/* TOOLBAR */}
       <div style={{display:'flex',alignItems:'center',gap:10,padding:'7px 20px',background:'#fff',borderBottom:'1px solid #ddd',flexShrink:0}}>
         <input style={{padding:'6px 10px',borderRadius:5,border:'1px solid #ddd',background:'#f5f5f0',fontSize:12,width:200,fontFamily:'IBM Plex Sans,sans-serif'}}
           placeholder="🔍  Client, OF, désignation…" value={q} onChange={e=>setQ(e.target.value)}/>
         <div style={{width:1,height:22,background:'#ddd'}}/>
-        {!READONLY&&<button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>}
-        {!READONLY&&<button onClick={()=>{
+        {!isLocked&&<button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>}
+        {!isLocked&&<button onClick={()=>{
           const todayIdx=filteredDates.indexOf(today);
           if(todayIdx>=0&&gridRef.current)
             gridRef.current.scrollLeft=Math.max(0,LW+(todayIdx*2-5)*hdw-80);
@@ -1477,7 +1624,7 @@ function App(){
           onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';}}
           onMouseLeave={e=>{e.currentTarget.style.background='#fff';}}
         >📅 Aujourd'hui</button>}
-        {!READONLY&&<button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
+        {!isLocked&&<button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
           display:'flex',alignItems:'center',gap:6,
           padding:'6px 13px',borderRadius:5,
           border:'1px solid #b8b5aa',background:'#fff',
@@ -1603,7 +1750,7 @@ function App(){
                     justifyContent:showOnSat?'flex-end':'flex-end',
                     pointerEvents:'none',
                   }}>
-                    <div onClick={READONLY?undefined:()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
+                    <div onClick={isLocked?undefined:()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
                       title={satOpen?'Modifier/fermer ce samedi':'Ouvrir ce samedi'}
                       style={{
                         width:16,height:16,borderRadius:'50%',cursor:'pointer',
@@ -1686,7 +1833,7 @@ function App(){
                         cursor:isSat?'default':'pointer',userSelect:'none',
                         transition:'background .15s',
                       }}
-                      onClick={(isSat||READONLY)?undefined:()=>toggleRegime(machine,date)}
+                      onClick={(isSat||isLocked)?undefined:()=>toggleRegime(machine,date)}
                       title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}
                     >
                       <span style={{
@@ -1724,7 +1871,7 @@ function App(){
                     >
                       <select
                         value={assignedId||''}
-                        disabled={READONLY}
+                        disabled={isLocked}
                         onChange={e=>{
                           const v=e.target.value;
                           setOperatorAssignment(machine,sc.date,sc.hd,v===''?null:v);
@@ -1737,7 +1884,7 @@ function App(){
                           fontFamily:'IBM Plex Mono,monospace',
                           fontSize:11,fontWeight:700,letterSpacing:.3,
                           textAlign:'center',textAlignLast:'center',
-                          cursor:READONLY?'default':'pointer',
+                          cursor:isLocked?'default':'pointer',
                           appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
                           padding:0,
                         }}
@@ -1766,7 +1913,7 @@ function App(){
                 {b1.map((band,bi)=>{
                   if(band.special){
                     return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
-                      onClick={READONLY?undefined:()=>setModal({type:'edit',data:{...band.row}})}
+                      onClick={isLocked?undefined:()=>setModal({type:'edit',data:{...band.row}})}
                     >
                       <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
                     </div>;
@@ -1784,15 +1931,15 @@ function App(){
                       borderRight:span>1?'1px solid rgba(0,0,0,.08)':'1px solid rgba(0,0,0,.08)',
                       borderRadius:'4px 4px 0 0',
                       padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
-                      cursor:READONLY?'pointer':'grab',
+                      cursor:isLocked?'pointer':'grab',
                       
                       backgroundImage:(isDone||band.bold)?'none':`repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px),linear-gradient(${color},${color})`,
                       zIndex:1,
                     }}
-                      draggable={!READONLY&&!resizeSrc} onDragStart={READONLY?undefined:e=>onDS(e,band.fr)}
-                      onDragOver={READONLY?undefined:e=>onDO(e,k)} onDragLeave={READONLY?undefined:onDL}
-                      onDrop={READONLY?undefined:e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
-                      onClick={READONLY?(e)=>setReadonlyPopup({band,x:e.clientX,y:e.clientY}):()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
+                      draggable={!isLocked&&!resizeSrc} onDragStart={isLocked?undefined:e=>onDS(e,band.fr)}
+                      onDragOver={isLocked?undefined:e=>onDO(e,k)} onDragLeave={isLocked?undefined:onDL}
+                      onDrop={isLocked?undefined:e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
+                      onClick={isLocked?(e)=>setReadonlyPopup({band,x:e.clientX,y:e.clientY}):()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
                       title={[
                         'OF : '+(band.of_number||'—'),
                         band.designation||'',
@@ -1815,7 +1962,7 @@ function App(){
                       </>);})()}
                       {dragOver===k&&<div style={{position:'absolute',inset:0,border:'2px solid #8a6a20',borderRadius:'inherit',pointerEvents:'none'}}/>}
                       {/* Resize handle — right edge */}
-                      <div onMouseDown={READONLY?undefined:e=>onResizeStart(e,band,1,machine)}
+                      <div onMouseDown={isLocked?undefined:e=>onResizeStart(e,band,1,machine)}
                         style={{position:'absolute',top:0,right:0,width:6,height:'100%',cursor:'ew-resize',zIndex:4,
                           background:'rgba(0,0,0,.0)'}}
                         onClick={e=>e.stopPropagation()}/>
@@ -1863,7 +2010,7 @@ function App(){
                         cursor:'pointer',position:'relative',
                         display:'flex',alignItems:'center',justifyContent:'center',
                       }}
-                        onClick={READONLY?undefined:()=>openClosure(machine,date)}
+                        onClick={isLocked?undefined:()=>openClosure(machine,date)}
                         title={`Machine fermée le ${date} — cliquer pour rouvrir`}
                       >
                         <span style={{fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',fontWeight:700,background:'rgba(255,255,255,.7)',padding:'1px 5px',borderRadius:3}}>🔒 FERMÉ</span>
@@ -1876,11 +2023,11 @@ function App(){
                       background:dragOver===k?'#edf5e0':date===today?'rgba(255,215,0,0.06)':isM?'#fafaf8':'#f5f5f2',
                       borderBottom:'1px solid rgba(0,0,0,.04)',
                       borderRight:isM?'none':'1px solid #dddbd3',
-                      cursor:READONLY?'default':'pointer',position:'relative'
+                      cursor:isLocked?'default':'pointer',position:'relative'
                     }}
-                      onDragOver={READONLY?undefined:e=>onDO(e,k)} onDragLeave={READONLY?undefined:onDL}
-                      onDrop={READONLY?undefined:e=>onDrop(e,machine,date,hd,1)}
-                      onClick={READONLY?undefined:()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
+                      onDragOver={isLocked?undefined:e=>onDO(e,k)} onDragLeave={isLocked?undefined:onDL}
+                      onDrop={isLocked?undefined:e=>onDrop(e,machine,date,hd,1)}
+                      onClick={isLocked?undefined:()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
                     />
                   );
                 })}
@@ -1936,7 +2083,7 @@ function App(){
                     >
                       <select
                         value={assignedId||''}
-                        disabled={READONLY}
+                        disabled={isLocked}
                         onChange={e=>{
                           const v=e.target.value;
                           setOperatorAssignment(vr.key,sc.date,sc.hd,v===''?null:v);
@@ -1948,7 +2095,7 @@ function App(){
                           fontFamily:'IBM Plex Mono,monospace',
                           fontSize:11,fontWeight:700,letterSpacing:.3,
                           textAlign:'center',textAlignLast:'center',
-                          cursor:READONLY?'default':'pointer',
+                          cursor:isLocked?'default':'pointer',
                           appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
                           padding:0,
                         }}
@@ -2018,10 +2165,21 @@ function App(){
           </div>
         </div>
       )}
-      {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={rows} subCols={subCols} dates={dates} sets={sets} sat={sat} clients={clients} onCloseMachine={saveClosure}/>}
+      {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={activeRows} subCols={subCols} dates={activeDates} sets={sets} sat={sat} clients={clients} onCloseMachine={saveClosure}/>}
       {showSet&&<Settings sets={sets} onChange={upd} onClose={()=>setShowSet(false)}/>}
       {showClients&&<ClientsManager onClose={()=>{setShowClients(false);load();}}/>}
       {showOperators&&<OperatorsManager onClose={()=>{setShowOperators(false);load();}}/>}
+      {showBackups&&<BackupModal onClose={()=>setShowBackups(false)} loadBackups={loadBackups} restoreBackup={restoreBackup} showToast={showToast} reload={load} createManualBackup={createManualBackup}
+        onPreview={async(backupId,backupDate)=>{
+          try{
+            const data=await sb('planning_backups?id=eq.'+backupId+'&select=snapshot');
+            if(!data||data.length===0) throw new Error('Snapshot introuvable');
+            const snapshotRows=JSON.parse(data[0].snapshot);
+            setPreviewData({rows:snapshotRows, backupId, backupDate});
+            setShowBackups(false);
+          }catch(e){showToast('Erreur chargement snapshot : '+e.message);}
+        }}
+      />}
       {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
         onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
       {toast&&<div className="toast">{toast}</div>}
@@ -2657,6 +2815,222 @@ function OperatorsManager({onClose}){
     </div>
   );
 }
+
+// ─── BACKUP MODAL ─────────────────────────────────────────────────────────────
+function BackupModal({onClose, loadBackups, restoreBackup, showToast, reload, onPreview, createManualBackup}){
+  const [backups,setBackups]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [saving,setSaving]=useState(false);   // sauvegarde manuelle en cours
+  const [restoring,setRestoring]=useState(null);
+  const [confirm,setConfirm]=useState(null);
+  const [previewing,setPreviewing]=useState(null);
+
+  function refresh(){
+    setLoading(true);
+    loadBackups().then(d=>{setBackups(d);setLoading(false);});
+  }
+
+  useEffect(()=>{ refresh(); },[]);
+
+  async function doManualSave(){
+    setSaving(true);
+    try{
+      await createManualBackup();
+      showToast('✓ Sauvegarde manuelle créée');
+      refresh();
+    }catch(e){
+      showToast('Erreur sauvegarde : '+e.message);
+    }finally{
+      setSaving(false);
+    }
+  }
+
+  async function doRestore(id,dateLabel){
+    setRestoring(id);
+    try{
+      await restoreBackup(id);
+      showToast('✓ Planning restauré — '+dateLabel);
+      reload();
+      onClose();
+    }catch(e){
+      showToast('Erreur restauration : '+e.message);
+    }finally{
+      setRestoring(null);
+      setConfirm(null);
+    }
+  }
+
+  // Détecte si une sauvegarde est manuelle (backup_date préfixé "M|")
+  function isManual(b){ return b.backup_date&&b.backup_date.startsWith('M|'); }
+
+  // Format backup_date → lisible
+  // Auto : dd/mm/yy → "12 mai 2026"
+  // Manuel : "M|dd/mm/yy|HH:MM" → "12 mai 2026 · HH:MM (manuel)"
+  function fmt(backup_date){
+    if(!backup_date) return backup_date;
+    if(backup_date.startsWith('M|')){
+      const parts=backup_date.split('|'); // ["M","dd/mm/yy","HH:MM"]
+      return fmtDate(parts[1])+(parts[2]?' · '+parts[2]:'')+' ✏';
+    }
+    return fmtDate(backup_date);
+  }
+  function fmtDate(s){
+    if(!s) return s;
+    const p=s.split('/');
+    if(p.length!==3) return s;
+    const months=['jan','fév','mar','avr','mai','jun','jul','aoû','sep','oct','nov','déc'];
+    return p[0]+' '+months[parseInt(p[1],10)-1]+' 20'+p[2];
+  }
+
+  // Pour la vérification "aujourd'hui", on extrait la date réelle
+  function getRealDate(b){
+    if(isManual(b)) return b.backup_date.split('|')[1];
+    return b.backup_date;
+  }
+
+  return(
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,.55)',display:'flex',alignItems:'flex-start',justifyContent:'flex-end',zIndex:110}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:'#fff',width:480,height:'100vh',overflowY:'auto',boxShadow:'-10px 0 40px rgba(0,0,0,.2)',padding:28,display:'flex',flexDirection:'column'}}>
+
+        {/* Titre + bouton sauvegarde manuelle */}
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+          <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,color:'#8a6a20',letterSpacing:1,textTransform:'uppercase'}}>
+            💾 Sauvegardes
+          </div>
+          <button
+            onClick={doManualSave}
+            disabled={saving}
+            style={{
+              display:'flex',alignItems:'center',gap:6,
+              padding:'7px 14px',borderRadius:6,
+              border:'1px solid #3d85c8',background:'#e8f0fe',
+              color:'#1a5cb5',fontSize:12,fontWeight:700,
+              cursor:saving?'wait':'pointer',
+              fontFamily:'IBM Plex Sans,sans-serif',
+            }}>
+            {saving
+              ?<><div style={{width:11,height:11,borderRadius:'50%',border:'2px solid #aaa',borderTopColor:'#3d85c8',animation:'spin .7s linear infinite'}}/>Sauvegarde…</>
+              :<>📸 Sauvegarder maintenant</>}
+          </button>
+        </div>
+
+        <div style={{fontSize:12,color:'#888',marginBottom:20,lineHeight:1.5}}>
+          Un snapshot automatique est créé <strong>chaque jour</strong> à la première ouverture.<br/>
+          Vous pouvez aussi créer une sauvegarde <strong>manuelle</strong> à tout moment. Les 60 derniers snapshots sont conservés.
+        </div>
+
+        {/* Confirmation overlay */}
+        {confirm&&(
+          <div style={{background:'#fff8e0',border:'1px solid #c9a84c',borderRadius:8,padding:16,marginBottom:16}}>
+            <div style={{fontSize:13,fontWeight:600,marginBottom:10,color:'#5a3e00'}}>
+              ⚠️ Confirmer la restauration — {fmt(confirm.date)} ?
+            </div>
+            <div style={{fontSize:12,color:'#666',marginBottom:14}}>
+              Le planning actuel sera <strong>remplacé</strong> par cette sauvegarde. Cette action est irréversible (sauf si une sauvegarde d'aujourd'hui existe déjà).
+            </div>
+            <div style={{display:'flex',gap:8}}>
+              <button className="btn btn-danger"
+                disabled={restoring!==null}
+                onClick={()=>doRestore(confirm.id,fmt(confirm.date))}
+                style={{minWidth:120}}>
+                {restoring===confirm.id?'Restauration…':'Oui, restaurer'}
+              </button>
+              <button className="btn" onClick={()=>setConfirm(null)}>Annuler</button>
+            </div>
+          </div>
+        )}
+
+        {loading?(
+          <div style={{color:'#aaa',fontSize:13,display:'flex',alignItems:'center',gap:8}}>
+            <div style={{width:14,height:14,borderRadius:'50%',border:'2px solid #eee',borderTopColor:'#c9a84c',animation:'spin .7s linear infinite'}}/>
+            Chargement…
+          </div>
+        ):backups.length===0?(
+          <div style={{color:'#aaa',fontSize:13,padding:'20px 0',textAlign:'center'}}>
+            Aucune sauvegarde disponible.<br/>
+            <span style={{fontSize:11,color:'#ccc'}}>Cliquez sur "Sauvegarder maintenant" pour créer la première.</span>
+          </div>
+        ):(
+          <div style={{flex:1,overflowY:'auto'}}>
+            {backups.map((b,i)=>{
+              const realDate=getRealDate(b);
+              const isToday=realDate===fd(new Date());
+              const manual=isManual(b);
+              return(
+                <div key={b.id} style={{
+                  display:'flex',alignItems:'center',gap:10,
+                  padding:'10px 12px',borderRadius:6,marginBottom:4,
+                  background:isToday?(manual?'#e8f0fe':'#f0f8e8'):'#f9f9f7',
+                  border:'1px solid '+(isToday?(manual?'#3d85c8':'#8aaa60'):'#eeede8'),
+                }}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:600,color:'#1a1916',display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+                      {fmtDate(realDate)}
+                      {manual&&<span style={{fontSize:10,background:'#3d85c8',color:'#fff',padding:'1px 6px',borderRadius:10}}>manuel</span>}
+                      {isToday&&!manual&&<span style={{fontSize:10,background:'#8aaa60',color:'#fff',padding:'1px 6px',borderRadius:10}}>aujourd'hui</span>}
+                      {isToday&&manual&&<span style={{fontSize:10,background:'#2a6abf',color:'#fff',padding:'1px 6px',borderRadius:10}}>aujourd'hui</span>}
+                      {i===0&&!isToday&&<span style={{fontSize:10,background:'#c9a84c',color:'#fff',padding:'1px 6px',borderRadius:10}}>plus récente</span>}
+                    </div>
+                    <div style={{fontSize:10,color:'#aaa',marginTop:2,fontFamily:'IBM Plex Mono,monospace'}}>
+                      {manual
+                        ? b.backup_date.split('|')[2]||''  // HH:MM extrait du label
+                        : b.created_at ? new Date(b.created_at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}) : ''
+                      }
+                    </div>
+                  </div>
+                  <div style={{display:'flex',gap:6,flexShrink:0}}>
+                    {/* Aperçu */}
+                    <button
+                      disabled={restoring!==null||previewing!==null}
+                      onClick={async()=>{
+                        setPreviewing(b.id);
+                        try{ await onPreview(b.id, fmt(b.backup_date)); }
+                        finally{ setPreviewing(null); }
+                      }}
+                      title="Visualiser ce snapshot dans le planning"
+                      style={{
+                        padding:'5px 10px',borderRadius:5,fontSize:11,fontWeight:600,cursor:'pointer',
+                        border:'1px solid #3d85c8',background:'#e8f0fe',color:'#1a5cb5',
+                        opacity:(restoring||previewing)&&previewing!==b.id?.5:1,
+                        fontFamily:'IBM Plex Sans,sans-serif',
+                        display:'flex',alignItems:'center',gap:4,
+                      }}>
+                      {previewing===b.id
+                        ?<><div style={{width:10,height:10,borderRadius:'50%',border:'2px solid #aaa',borderTopColor:'#3d85c8',animation:'spin .7s linear infinite'}}/>…</>
+                        :<>👁 Aperçu</>}
+                    </button>
+                    {/* Restaurer */}
+                    <button
+                      disabled={restoring!==null||previewing!==null}
+                      onClick={()=>setConfirm({id:b.id,date:b.backup_date})}
+                      title="Restaurer ce snapshot"
+                      style={{
+                        padding:'5px 10px',borderRadius:5,fontSize:11,fontWeight:600,cursor:'pointer',
+                        border:'1px solid #c9a84c',background:'#fffbf0',color:'#8a6a20',
+                        opacity:restoring&&restoring!==b.id?.5:1,
+                        fontFamily:'IBM Plex Sans,sans-serif',
+                      }}>
+                      ↩ Restaurer
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{marginTop:16,fontSize:11,color:'#bbb',borderTop:'1px solid #f0efe9',paddingTop:12,lineHeight:1.7}}>
+          💡 <strong style={{color:'#888'}}>📸 Sauvegarder maintenant</strong> : snapshot immédiat, disponible dans la liste.<br/>
+          <strong style={{color:'#888'}}>👁 Aperçu</strong> : visualise le snapshot dans le planning avant de décider.<br/>
+          <strong style={{color:'#888'}}>↩ Restaurer</strong> : remplace le planning actuel après confirmation.
+        </div>
+        <button className="btn" style={{marginTop:12}} onClick={onClose}>Fermer</button>
+      </div>
+    </div>
+  );
+}
+// ─── END BACKUP MODAL ─────────────────────────────────────────────────────────
 
 ReactDOM.render(<App/>,document.getElementById('root'));
 </script>
