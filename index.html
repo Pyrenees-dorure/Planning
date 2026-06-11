@@ -73,8 +73,9 @@ function unlock(){
   sessionStorage.setItem('_auth','1');
   document.getElementById('lock').style.display='none';
 }
-if(sessionStorage.getItem('_auth')==='1') unlock();
-document.getElementById('pwd').focus();
+if(new URLSearchParams(window.location.search).get('readonly')==='1') unlock();
+else if(sessionStorage.getItem('_auth')==='1') unlock();
+else document.getElementById('pwd').focus();
 </script>
 
 <script>
