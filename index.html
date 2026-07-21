@@ -317,6 +317,32 @@ function mkBands(machine, slot, subCols, lkp){
   return bands;
 }
 
+// ─── OPTIMISATION BANDE PASSANTE ─────────────────────────────────────────
+// Fenêtre de rafraîchissement automatique : lundi → vendredi, 07:30 → 18:00
+function inWorkWindow(d){
+  d = d || new Date();
+  var day = d.getDay();                 // 0 = dimanche, 6 = samedi
+  if(day === 0 || day === 6) return false;
+  var mins = d.getHours()*60 + d.getMinutes();
+  return mins >= (7*60+30) && mins <= (18*60);
+}
+
+// Colonnes réellement utilisées par l'app (évite select=* qui rapatrie tout).
+// Repli automatique sur "*" si une colonne n'existe pas encore en base.
+var PLANNING_COLS = 'id,date,machine,slot,half_day,of_number,client,designation,mac,qte,format,depart,conducteur,bold,of_id';
+async function sbPlanning(){
+  try{
+    return await sb('planning?order=date,machine,slot,half_day&select='+PLANNING_COLS);
+  }catch(e){
+    if(PLANNING_COLS !== '*'){
+      console.warn('[PDD] select explicite refusé, repli sur select=* :', e.message);
+      PLANNING_COLS = '*';
+      return await sb('planning?order=date,machine,slot,half_day&select=*');
+    }
+    throw e;
+  }
+}
+
 function App(){
   const [rows,setRows]=useState([]);
   const [regimes,setRegimes]=useState({});
@@ -359,11 +385,11 @@ function App(){
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
       const [data,regData,closureData,opData,opAssignData]=await Promise.all([
-        sb('planning?order=date,machine,slot,half_day&select=*'),
-        sb('machine_regime?select=*'),
-        sb('machine_closure?select=*'),
-        sb('operators?select=*'),
-        sb('operator_assignments?select=*'),
+        sbPlanning(),
+        sb('machine_regime?select=machine,date,mode'),
+        sb('machine_closure?select=machine,date'),
+        sb('operators?select=id,nom,abrev,color,archived'),
+        sb('operator_assignments?select=machine,date,half_day,operator_id'),
       ]);
       const rm={};
       (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
@@ -400,13 +426,13 @@ function App(){
     const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
       const [data,cliData,regData,satData,closureData,opData,opAssignData]=await Promise.all([
-        sb('planning?order=date,machine,slot,half_day&select=*'),
+        sbPlanning(),
         sb('clients?order=nom&select=nom'),
-        sb('machine_regime?select=*'),
-        sb('saturday_config?select=*'),
-        sb('machine_closure?select=*'),
-        sb('operators?select=*'),
-        sb('operator_assignments?select=*'),
+        sb('machine_regime?select=machine,date,mode'),
+        sb('saturday_config?select=date,machines'),
+        sb('machine_closure?select=machine,date'),
+        sb('operators?select=id,nom,abrev,color,archived'),
+        sb('operator_assignments?select=machine,date,half_day,operator_id'),
       ]);
       const sc={};
       (satData||[]).forEach(r=>{sc[r.date]=r.machines||[];});
@@ -524,13 +550,48 @@ function App(){
   const previewDataRef=useRef(null);
   useEffect(()=>{previewDataRef.current=previewData;},[previewData]);
 
+  // ─── AUTO-SYNC ÉCONOME EN BANDE PASSANTE ────────────────────────────────
+  // Consultation (?readonly=1) : sync toutes les 5 min.
+  // Édition : pas d'auto-sync périodique — chaque action recharge déjà les
+  // données, et le retour sur l'onglet déclenche une resynchro.
+  // Dans les deux cas : pause si onglet caché, pause hors lun-ven 7h30-18h00.
+  const SYNC_MS = 300000;
+  const [syncPaused, setSyncPaused] = useState(!inWorkWindow());
+
   useEffect(()=>{
     load().then(planningRows=>{
       // Snapshot quotidien automatique — réutilise les données déjà chargées
       if(planningRows) createDailyBackup(planningRows);
     });
-    const t=setInterval(()=>{ if(!busyRef.current && !modalOpenRef.current && !previewDataRef.current) load(); },30000);
-    return()=>clearInterval(t);
+
+    const canSync = ()=> !busyRef.current && !modalOpenRef.current && !previewDataRef.current;
+    const lastSync = { t: Date.now() };
+
+    const tick = ()=>{
+      if(document.visibilityState !== 'visible') return;   // onglet caché / écran en veille
+      if(!inWorkWindow()){ setSyncPaused(true); return; }  // hors plage de travail
+      setSyncPaused(false);
+      if(canSync()){ lastSync.t = Date.now(); load(); }
+    };
+    const t = READONLY ? setInterval(tick, SYNC_MS) : null;
+
+    // Retour sur l'onglet : resynchro immédiate, 1 fois par minute maximum
+    const onVis = ()=>{
+      if(document.visibilityState !== 'visible') return;
+      if(!inWorkWindow()){ setSyncPaused(true); return; }
+      setSyncPaused(false);
+      if(Date.now() - lastSync.t < 60000) return;
+      if(canSync()){ lastSync.t = Date.now(); load(); }
+    };
+    document.addEventListener('visibilitychange', onVis);
+
+    // Réévalue l'état "en pause" toutes les minutes (pour le bandeau)
+    const tw = setInterval(()=>{ setSyncPaused(!inWorkWindow()); }, 60000);
+
+    return()=>{
+      if(t) clearInterval(t); clearInterval(tw);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   },[sat]);
 
   // scrolledRef tracks whether we've done the initial scroll to today
@@ -747,7 +808,7 @@ function App(){
     const x=e.clientX-rect.left+scrollX-LW;
     if(x<0) return null;
     const idx=Math.floor(x/hdw);
-    if(idx>=0&&idx<subCols.length) return {idx, ...subCols[idx]};
+    if(idx>=0&&idx<filteredSubCols.length) return {idx, ...filteredSubCols[idx]}; // grille affichée (corrige le drop avec recherche active)
     return null;
   }
 
@@ -756,191 +817,204 @@ function App(){
     if(!dragSrc)return;
     busyRef.current=true;
     const src=dragSrc; setDragSrc(null);
-    // Override tDate/tHD with actual mouse position (fixes drop on own band)
-    const actualCol=subColFromEvent(e);
-    if(actualCol){tDate=actualCol.date;tHD=actualCol.hd;}
-
-    // All half-day slots of the dragged OF
-    const ofR=rows.filter(r=>
-      r.machine===src.machine&&r.slot===src.slot&&
-      r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation
-    ).sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-
-    const dur=ofR.length;
-    const srcIdx=subColsMap.get(src.date+'|'+(src.half_day||1));
-    const tgtIdx=subColsMap.get(tDate+'|'+tHD);
-    const diff=tgtIdx-srcIdx;
-    if(diff===0&&src.machine===tMachine&&src.slot===tSlot)return;
-
-    // Si changement de machine : recalculer la durée en équipes
-    let newDur=dur;
-    if(tMachine!==src.machine){
-      // Calculer le nb total d'équipes sur la machine source
-      const totalEq=ofR.reduce((sum,r)=>{
-        const m=getRegime(regimes,src.machine,r.date);
-        return sum+(m==='2x8'?1:0.5);
-      },0);
-      // Replanifier sur la machine cible depuis tgtIdx
-      let eq=0; newDur=0;
-      for(let i=tgtIdx;i<subCols.length&&eq<totalEq;i++){
-        const m=getRegime(regimes,tMachine,subCols[i].date);
-        eq+=(m==='2x8'?1:0.5);
-        newDur++;
-      }
-    }
-
-    // === COMPUTE MOVES ===
-    // 1. New positions for the dragged OF
-    const dragMoves=[];
-    if(tMachine===src.machine){
-      // Même machine : préserver les positions relatives via subCols machine-spécifique
-      const msc=getMachineSubCols(tMachine);
-      const mSrcIdx=msc.findIndex(c=>c.date===src.date&&c.hd===(src.half_day||1));
-      const mTgtIdx=msc.findIndex(c=>c.date===tDate&&c.hd===tHD);
-      const mDiff=mTgtIdx-mSrcIdx;
-      for(const r of ofR){
-        const ri=msc.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-        const ni=ri+mDiff;
-        if(ni>=0&&ni<msc.length) dragMoves.push({r, nc:msc[ni], isNew:false});
-      }
-    } else {
-      // Changement de machine : placer depuis tgtIdx avec newDur slots machine-spécifiques
-      const msc=getMachineSubCols(tMachine);
-      const mTgtIdx=msc.findIndex(c=>c.date===tDate&&c.hd===tHD);
-      for(let i=0;i<newDur;i++){
-        const ni=mTgtIdx+i;
-        if(ni>=0&&ni<msc.length) dragMoves.push({r:ofR[i]||ofR[ofR.length-1], nc:msc[ni], isNew:i>=dur});
-      }
-    }
-    if(dragMoves.length===0){busyRef.current=false;return;}
-
-    // 2. Find which OFs on the TARGET machine+slot need to move
-    //    because the dragged OF will land on their positions.
-    //    Only look at rows on tMachine+tSlot (not source machine).
-    //    The dragged OF occupies [tgtIdx, tgtIdx+dur-1] after the move.
-    const newPositions=new Set(dragMoves.map(m=>subColsMap.get(m.nc.date+'|'+m.nc.hd)));
-
-    // src positions being freed — these slots become available
-    const srcIndices=new Set(ofR.map(r=>subColsMap.get(r.date+'|'+(r.half_day||1))));
-    // New positions the dragged OF will occupy
-    const newOccupied=new Set(dragMoves.map(m=>subColsMap.get(m.nc.date+'|'+m.nc.hd)));
-
-    // Build OF groups on target machine+slot, excluding src positions (they're being freed)
-    const ofMap={};
-    const sameMachine=tMachine===src.machine;
-    rows.forEach(r=>{
-      if(r.machine!==tMachine||r.slot!==tSlot) return;
-      if(r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation) return;
-      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-      if(sameMachine&&srcIndices.has(ri)) return; // libérés uniquement si même machine
-      const k=r.of_number+'§'+r.client+'§'+r.designation;
-      if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1};
-      ofMap[k].rows.push(r);
-      if(ri<ofMap[k].minIdx) ofMap[k].minIdx=ri;
-      if(ri>ofMap[k].maxIdx) ofMap[k].maxIdx=ri;
-    });
-    const sortedGroups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
-
-    // clearPos = premier slot libre APRÈS le dernier slot réel de l'OF déplacé
-    // (indépendant du slot saisi — corrige le bug de sur-décalage)
-    const newOccupiedArr=[...newOccupied].filter(i=>i!==undefined).sort((a,b)=>a-b);
-    const clearPos=newOccupiedArr.length>0 ? newOccupiedArr[newOccupiedArr.length-1]+1 : tgtIdx+newDur;
-
-    // Only push groups that overlap the NEW positions (not freed src positions)
-    // Cascade stops at first gap
-    const allToShiftRows=[];
-    let pushEnd=clearPos;
-    for(const grp of sortedGroups){
-      if(grp.maxIdx<(newOccupiedArr[0]??tgtIdx)) continue; // entirely before new zone
-      if(grp.minIdx>=pushEnd) break;  // gap — stop
-      // Check real overlap with newOccupied
-      const realOverlap=grp.rows.some(r=>{
-        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-        return newOccupied.has(ri);
-      });
-      if(!realOverlap) break;
-      grp.rows.forEach(r=>allToShiftRows.push(r));
-      pushEnd=Math.max(pushEnd, grp.maxIdx+1);
-    }
-
-    // For each conflicting OF group, move ALL its rows together (keeping group intact)
-    const groupMap={};
-    allToShiftRows.forEach(r=>{
-      const k=r.of_number+'§'+r.client+'§'+r.designation;
-      if(!groupMap[k]) groupMap[k]={rows:[],minIdx:Infinity};
-      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-      groupMap[k].rows.push({r,ri});
-      if(ri<groupMap[k].minIdx) groupMap[k].minIdx=ri;
-    });
-    const shiftMoves=[];
-    // Trier les groupes par position et décaler séquentiellement
-    const sortedGrps=Object.values(groupMap).sort((a,b)=>a.minIdx-b.minIdx);
-    let nextFree=clearPos;
-    for(const grp of sortedGrps){
-      const grpSize=grp.rows.reduce((mx,{ri})=>Math.max(mx,ri),0) - grp.minIdx + 1;
-      const offset=nextFree-grp.minIdx;
-      for(const {r,ri} of grp.rows){
-        const ni=ri+offset;
-        if(ni>=0&&ni<subCols.length) shiftMoves.push({r, nc:subCols[ni]});
-      }
-      nextFree=nextFree+grpSize;
-    }
-
-    // === ATOMIC EXECUTE ===
-    const actualDeleted=[];
-    const actualInserted=[];
+    let didChange=false;
     try{
-      // Collecter tous les IDs à supprimer
-      const dragSrcRows=dragMoves.filter(m=>!m.isNew).map(m=>m.r);
-      const allSrcToDelete=ofR.filter(r=>!dragMoves.find(m=>!m.isNew&&m.r.id===r.id));
-      const allToDelete=[...dragSrcRows,...shiftMoves.map(m=>m.r),...allSrcToDelete];
-      actualDeleted.push(...allToDelete);
+      // Position réelle de la souris (grille affichée)
+      const actualCol=subColFromEvent(e);
+      if(actualCol){tDate=actualCol.date;tHD=actualCol.hd;}
 
-      // BULK DELETE
-      if(allToDelete.length>0){
-        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      // Identification de l'OF : par of_id si renseigné, sinon n°OF+client+désignation
+      const isSameOf = src.of_id
+        ? (r=>r.of_id===src.of_id)
+        : (r=>r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation);
+      const ofR=rows.filter(r=>r.machine===src.machine&&r.slot===src.slot&&isSameOf(r))
+        .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
+      if(ofR.length===0) return;
+      const dur=ofR.length;
+
+      // Dépôt à l'identique -> rien à faire
+      if(tMachine===src.machine&&tSlot===src.slot&&tDate===src.date&&tHD===(src.half_day||1)) return;
+
+      // ── Grille de la machine CIBLE (exclut jours fermés / samedis non ouverts) ──
+      const msc=getMachineSubCols(tMachine);
+      const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
+      const mscG=msc.map(c=>subColsMap.get(c.date+'|'+c.hd));
+      // Index msc du créneau (date,hd), ou du premier créneau ouvert suivant
+      const mscAtOrAfter=(date,hd)=>{
+        const direct=mscMap.get(date+'|'+hd);
+        if(direct!==undefined) return direct;
+        const g=subColsMap.get(date+'|'+hd);
+        if(g===undefined) return -1;
+        for(let k=0;k<mscG.length;k++) if(mscG[k]>=g) return k;
+        return -1;
+      };
+
+      let mTgtIdx=mscAtOrAfter(tDate,tHD);
+      if(mTgtIdx<0){showToast('Dépôt impossible : aucun créneau ouvert pour '+tMachine+' à cette date');return;}
+      // Recale sur le créneau réellement ouvert (si on a visé un jour fermé)
+      tDate=msc[mTgtIdx].date; tHD=msc[mTgtIdx].hd;
+
+      // Si changement de machine : recalcule la durée en équipes sur la grille cible
+      let newDur=dur;
+      if(tMachine!==src.machine){
+        const totalEq=ofR.reduce((sum,r)=>{
+          const m=getRegime(regimes,src.machine,r.date);
+          return sum+(m==='2x8'?1:0.5);
+        },0);
+        let eq=0; newDur=0;
+        for(let k=mTgtIdx;k<msc.length&&eq<totalEq;k++){
+          const m=getRegime(regimes,tMachine,msc[k].date);
+          eq+=(m==='2x8'?1:0.5);
+          newDur++;
+        }
       }
 
-      // BULK INSERT shifts
-      if(shiftMoves.length>0){
-        const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
-        const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
-        if(res) actualInserted.push(...res);
+      // ── Nouvelles positions de l'OF déplacé — TOUJOURS dans la grille machine ──
+      const dragMoves=[];
+      if(tMachine===src.machine){
+        const mSrcIdx=mscAtOrAfter(src.date,src.half_day||1);
+        if(mSrcIdx<0) return;
+        const mDiff=mTgtIdx-mSrcIdx;
+        const usedNi=new Set();
+        for(const r of ofR){
+          const ri=mscAtOrAfter(r.date,r.half_day||1);
+          if(ri<0) continue;
+          let ni=ri+mDiff;
+          while(usedNi.has(ni)) ni++;
+          if(ni>=0&&ni<msc.length){usedNi.add(ni);dragMoves.push({r,nc:msc[ni],isNew:false});}
+        }
+      } else {
+        for(let k=0;k<newDur;k++){
+          const ni=mTgtIdx+k;
+          if(ni<msc.length) dragMoves.push({r:ofR[k]||ofR[ofR.length-1],nc:msc[ni],isNew:k>=dur});
+        }
       }
+      if(dragMoves.length===0) return;
 
-      // BULK INSERT dragged OF
-      const lastSrc=ofR[ofR.length-1];
-      const dragPayload=dragMoves.map(({r,nc,isNew})=>{
-        const base=isNew?lastSrc:r;
-        const {id,...rest}=base;
-        return {...rest,machine:tMachine,date:nc.date,half_day:nc.hd,slot:tSlot};
+      // ── Conflits : tout est calculé en indices machine (msc) ──
+      const newOccupied=new Set(dragMoves.map(m=>mscMap.get(m.nc.date+'|'+m.nc.hd)));
+      const newArr=[...newOccupied].sort((a,b)=>a-b);
+      const newMin=newArr[0], newMax=newArr[newArr.length-1];
+
+      const sameMachine=tMachine===src.machine;
+      const srcIndices=sameMachine?new Set(ofR.map(r=>mscAtOrAfter(r.date,r.half_day||1))):new Set();
+
+      // Occupation d'origine de la ligne cible (OF déplacé inclus) — sert à
+      // détecter les OF "isolés" (= calés à une date de réception matière)
+      const occupiedOrig=new Set();
+      rows.forEach(r=>{
+        if(r.machine!==tMachine||r.slot!==tSlot)return;
+        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
+        if(mi!==undefined)occupiedOrig.add(mi);
       });
-      if(dragPayload.length>0){
-        const res=await sb('planning',{method:'POST',body:JSON.stringify(dragPayload),prefer:'return=representation'});
-        if(res) actualInserted.push(...res);
+
+      // Groupes d'OF présents sur la ligne cible (hors OF déplacé)
+      const ofMap={};
+      rows.forEach(r=>{
+        if(r.machine!==tMachine||r.slot!==tSlot) return;
+        if(isSameOf(r)&&r.machine===src.machine&&r.slot===src.slot) return;
+        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
+        if(mi===undefined) return;
+        if(sameMachine&&src.slot===tSlot&&srcIndices.has(mi)) return; // créneaux libérés
+        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
+        if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+        ofMap[k].rows.push({r,mi});
+        if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
+        if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
+      });
+      const sortedGroups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
+
+      // ── Cascade : pousse chaque groupe en collision du minimum nécessaire.
+      //    La chaîne continue tant qu'un groupe repoussé en percute un autre.
+      const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
+      let nextFree=newMax+1;
+      for(const grp of sortedGroups){
+        if(grp.maxIdx<newMin) continue;      // entièrement avant la zone d'arrivée
+        if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
+        const offset=nextFree-grp.minIdx;
+        // OF isolé = pas de créneau occupé juste devant lui -> calé sur une date
+        if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp);
+        pushedGroups.push(grp);
+        for(const {r,mi} of grp.rows){
+          const ni=mi+offset;
+          if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
+        }
+        nextFree=grp.maxIdx+offset+1;
       }
 
-      pushHistory('Déplacement '+src.client, {deleted:actualDeleted, inserted:actualInserted});
-      const nPushed=new Set(allToShiftRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation)).size;
-      if(nPushed>0) showToast('✓ OF déplacé · '+nPushed+' repoussé(s) · Ctrl+Z');
-      else showToast('✓ OF déplacé · Ctrl+Z pour annuler');
-    }catch(err){
-      console.error('onDrop error:', err);
-      showToast('Erreur: '+err.message.slice(0,120));
-      // Rollback bulk
+      // ── VALIDATION : des OF calés sur une réception matière vont être repoussés ──
+      if(anchoredPushed.length>0){
+        const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
+        const okGo=window.confirm(
+          '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
+          'Ce déplacement va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
+          noms+'\n\n'+
+          'Ces OF sont normalement calés sur une date de réception de matière.\n\n'+
+          'OK = repousser quand même\nAnnuler = ne rien déplacer'
+        );
+        if(!okGo){showToast('Déplacement annulé — OF calé sur réception matière');return;}
+      }
+
+      // ── EXÉCUTION ATOMIQUE ──
+      const actualDeleted=[];
+      const actualInserted=[];
+      didChange=true;
       try{
-        if(actualInserted.length>0){
-          const ids=actualInserted.map(r=>r.id).join(',');
+        const dragSrcRows=dragMoves.filter(m=>!m.isNew).map(m=>m.r);
+        const allSrcToDelete=ofR.filter(r=>!dragMoves.find(m=>!m.isNew&&m.r.id===r.id));
+        const allToDelete=[...dragSrcRows,...shiftMoves.map(m=>m.r),...allSrcToDelete];
+        actualDeleted.push(...allToDelete);
+
+        // BULK DELETE
+        if(allToDelete.length>0){
+          const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
           await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
         }
-        if(actualDeleted.length>0){
-          const payload=actualDeleted.map(({id,...rest})=>rest);
-          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+
+        // BULK INSERT : OF repoussés
+        if(shiftMoves.length>0){
+          const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
+          const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
+          if(res) actualInserted.push(...res);
         }
-        showToast('État restauré');
-      }catch(e2){showToast('Restauration partielle — Ctrl+Z');}
-    }finally{busyRef.current=false;loadPlanning();}  }
+
+        // BULK INSERT : OF déplacé
+        const lastSrc=ofR[ofR.length-1];
+        const dragPayload=dragMoves.map(({r,nc,isNew})=>{
+          const base=isNew?lastSrc:r;
+          const {id,...rest}=base;
+          return {...rest,machine:tMachine,date:nc.date,half_day:nc.hd,slot:tSlot};
+        });
+        if(dragPayload.length>0){
+          const res=await sb('planning',{method:'POST',body:JSON.stringify(dragPayload),prefer:'return=representation'});
+          if(res) actualInserted.push(...res);
+        }
+
+        pushHistory('Déplacement '+src.client, {deleted:actualDeleted, inserted:actualInserted});
+        const nPushed=pushedGroups.length;
+        if(nPushed>0) showToast('\u2713 OF déplacé · '+nPushed+' repoussé(s) · Ctrl+Z');
+        else showToast('\u2713 OF déplacé · Ctrl+Z pour annuler');
+      }catch(err){
+        console.error('onDrop error:', err);
+        showToast('Erreur: '+err.message.slice(0,120));
+        // Rollback
+        try{
+          if(actualInserted.length>0){
+            const ids=actualInserted.map(r=>r.id).join(',');
+            await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+          }
+          if(actualDeleted.length>0){
+            const payload=actualDeleted.map(({id,...rest})=>rest);
+            await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+          }
+          showToast('État restauré');
+        }catch(e2){showToast('Restauration partielle — Ctrl+Z');}
+      }
+    }finally{
+      busyRef.current=false;          // le verrou est TOUJOURS relâché (corrige l'auto-sync gelé)
+      if(didChange) loadPlanning();
+    }
+  }
 
   async function onSave(formData, halfDayCount, origData, newDurOverride){
     busyRef.current=true;
@@ -1230,102 +1304,121 @@ function App(){
     const newlyAdded=machines.filter(m=>!prevMachines.includes(m));
     const newlyRemoved=prevMachines.filter(m=>!machines.includes(m));
 
+    // ── 1. TOUT est calculé AVANT d'écrire quoi que ce soit en base ──
+    // Grille d'une machine avec/sans LE samedi basculé (autres samedis et
+    // jours fermés de la machine respectés)
+    const machineCols=(machine,satOpen)=>{
+      const allDates=new Set(dates);
+      if(satOpen) allDates.add(date); else allDates.delete(date);
+      const sorted=[...allDates].sort((a,b)=>pd(a)-pd(b));
+      const cols=[];
+      sorted.forEach(d=>{
+        if(d!==date){
+          const dow=pd(d).getDay();
+          if(dow===6&&!((satConfigs[d]||[]).includes(machine))) return;
+        }
+        if(closures[machine+'|'+d]) return;
+        cols.push({date:d,hd:1});cols.push({date:d,hd:2});
+      });
+      return cols;
+    };
+
+    const allToDelete=[]; const allToInsert=[]; const anchoredPushed=[];
+
+    for(const machine of [...newlyAdded,...newlyRemoved]){
+      const opened=newlyAdded.includes(machine);
+      const oldMsc=machineCols(machine,!opened);
+      const newMsc=machineCols(machine,opened);
+      const oldMap=new Map(); oldMsc.forEach((c,k)=>oldMap.set(c.date+'|'+c.hd,k));
+      const newMap=new Map(); newMsc.forEach((c,k)=>newMap.set(c.date+'|'+c.hd,k));
+      // Premier créneau de la nouvelle grille à partir de (date,hd)
+      const newIdxAtOrAfter=(d,hd)=>{
+        const direct=newMap.get(d+'|'+hd);
+        if(direct!==undefined) return direct;
+        const g=pd(d).getTime();
+        for(let k=0;k<newMsc.length;k++){
+          const gt=pd(newMsc[k].date).getTime();
+          if(gt>g||(gt===g&&newMsc[k].hd>=hd)) return k;
+        }
+        return -1;
+      };
+
+      const machRows=rows.filter(r=>r.machine===machine);
+      const slots=[...new Set(machRows.map(r=>r.slot))];
+      for(const slot of slots){
+        const ofMap={};
+        machRows.forEach(r=>{
+          if(r.slot!==slot) return;
+          const mi=oldMap.get(r.date+'|'+(r.half_day||1));
+          if(mi===undefined) return;
+          const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
+          if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+          ofMap[k].rows.push({r,mi});
+          if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
+          if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
+        });
+        const groups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
+
+        let prevOrigEnd=-2, prevNewEnd=-1;
+        for(const grp of groups){
+          grp.rows.sort((a,b)=>a.mi-b.mi);
+          const glued=grp.minIdx===prevOrigEnd+1;
+          const first=grp.rows[0].r;
+          // OF collé -> suit le mouvement ; OF isolé -> garde sa date de départ
+          let ns=glued?prevNewEnd+1:newIdxAtOrAfter(first.date,first.half_day||1);
+          if(ns<0) ns=prevNewEnd+1;
+          if(!glued&&ns<=prevNewEnd){ ns=prevNewEnd+1; anchoredPushed.push(grp); }
+          const nd=grp.rows.length; // durée en demi-journées inchangée
+          prevOrigEnd=grp.maxIdx; prevNewEnd=ns+nd-1;
+          // Aucun changement de cellules -> aucune écriture
+          const same=grp.rows.every(({r},idx)=>{
+            const ni=ns+idx;
+            return ni<newMsc.length&&newMsc[ni].date===r.date&&newMsc[ni].hd===(r.half_day||1);
+          });
+          if(same) continue;
+          grp.rows.forEach(({r})=>allToDelete.push(r));
+          grp.rows.forEach(({r},idx)=>{
+            const ni=ns+idx;
+            if(ni<0||ni>=newMsc.length) return;
+            const {id,...rest}=r;
+            allToInsert.push({...rest,date:newMsc[ni].date,half_day:newMsc[ni].hd});
+          });
+        }
+      }
+    }
+
+    // ── 2. VALIDATION réception matière (avant toute écriture) ──
+    if(anchoredPushed.length>0){
+      const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
+      const okGo=window.confirm(
+        '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
+        'Cette modification du samedi '+date+' va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
+        noms+'\n\n'+
+        'OK = repousser quand même\nAnnuler = ne rien modifier'
+      );
+      if(!okGo){ showToast('Modification du samedi annulée'); return; }
+    }
+
     setSatModal(null);
 
+    // ── 3. ÉCRITURE ──
+    busyRef.current=true;
     try{
       await sb('saturday_config?date=eq.'+encodeURIComponent(date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
       if(machines.length>0)
         await sb('saturday_config',{method:'POST',body:JSON.stringify({date,machines}),prefer:'return=minimal'});
 
-      busyRef.current=true;
-      const satD=pd(date);
-      const monD=new Date(satD);monD.setDate(satD.getDate()+2);
-      const monDate=fd(monD);
-
-      // Build extended subCols including Saturday slots
-      // This is the full sequence: ...FriM, FriPM, SatM, SatPM, MonM, MonPM...
-      function buildExtSubCols(withSat, machine){
-        const allDates=new Set(dates);
-        if(withSat) allDates.add(date);
-        else allDates.delete(date);
-        // Exclure les jours fermés de la machine
-        if(machine){
-          Object.keys(closures).forEach(k=>{
-            if(k.startsWith(machine+'|')) allDates.delete(k.split('|')[1]);
-          });
-        }
-        const sorted=[...allDates].sort((a,b)=>pd(a)-pd(b));
-        const cols=[];
-        sorted.forEach(d=>{ cols.push({date:d,hd:1}); cols.push({date:d,hd:2}); });
-        return cols;
-      }
-
-      // OPEN: slots shift from "subCols without Sat" positions to "subCols with Sat" positions
-      // Each slot at monDate+ moves back by 2 (Saturday takes slots 0,1; Monday shifts to 2,3...)
-      // = each row's index in the WITH-SAT sequence = its index in WITHOUT-SAT sequence + 2
-      // So: new position = current position - 2 in the WITH-SAT sequence
-      // Equivalently: row at monDate/hd:1 → satDate/hd:1, monDate/hd:2 → satDate/hd:2,
-      //               nextDate/hd:1 → monDate/hd:1, etc.
-      // Simple: each row shifts by -2 in the extended subcols
-
-      for(const machine of newlyAdded){
-        const extCols=buildExtSubCols(true,machine);
-        const ecMap=new Map(); extCols.forEach((c,i)=>ecMap.set(c.date+'|'+c.hd,i));
-        const monI=ecMap.get(monDate+'|1')??Infinity;
-        const toShift=rows.filter(r=>{
-          if(r.machine!==machine) return false;
-          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
-          return ri!==undefined && ri>=monI;
-        });
-        if(toShift.length===0) continue;
-
-        // Bulk DELETE
-        const ids=toShift.map(r=>r.id).join(',');
+      if(allToDelete.length>0){
+        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
         await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-
-        // Bulk INSERT décalés de -2
-        const payload=toShift.map(r=>{
-          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
-          const ni=ri-2;
-          if(ni<0) return null;
-          const nc=extCols[ni];
-          const {id,...rest}=r;
-          return {...rest,date:nc.date,half_day:nc.hd};
-        }).filter(Boolean);
-        if(payload.length>0)
-          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
       }
-
-      for(const machine of newlyRemoved){
-        const extCols=buildExtSubCols(true,machine);
-        const ecMap=new Map(); extCols.forEach((c,i)=>ecMap.set(c.date+'|'+c.hd,i));
-        const satI=ecMap.get(date+'|1')??Infinity;
-        const toShift=rows.filter(r=>{
-          if(r.machine!==machine) return false;
-          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
-          return ri!==undefined && ri>=satI;
-        });
-        if(toShift.length===0) continue;
-
-        const extColsNoSat=buildExtSubCols(false,machine);
-        const ecNoMap=new Map(); extColsNoSat.forEach((c,i)=>ecNoMap.set(c.date+'|'+c.hd,i));
-
-        // Bulk DELETE
-        const ids=toShift.map(r=>r.id).join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-
-        // Bulk INSERT au même index dans extColsNoSat
-        const payload=toShift.map(r=>{
-          const ri=ecMap.get(r.date+'|'+(r.half_day||1));
-          if(ri===undefined||ri>=extColsNoSat.length) return null;
-          const nc=extColsNoSat[ri];
-          const {id,...rest}=r;
-          return {...rest,date:nc.date,half_day:nc.hd};
-        }).filter(Boolean);
-        if(payload.length>0)
-          await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+      let insertedRes=[];
+      if(allToInsert.length>0){
+        insertedRes=await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=representation'})||[];
       }
-
+      if(allToDelete.length>0||allToInsert.length>0){
+        pushHistory('Samedi '+date, {deleted:allToDelete, inserted:insertedRes});
+      }
     }catch(e){showToast('Erreur samedi: '+e.message);}
     finally{
       busyRef.current=false;
@@ -1343,132 +1436,102 @@ function App(){
     const cur=getRegime(regimes,machine,date);
     const next=cur==='1x8'?'2x8':'1x8';
 
-    // Optimistic UI update immédiat
-    setRegimes(r=>({...r,[machine+'|'+date]:next}));
+    // ── 1. TOUT est calculé AVANT d'écrire quoi que ce soit en base ──
+    const newRegimes={...regimes,[machine+'|'+date]:next};
+    const eqNew=d=>((newRegimes[machine+'|'+d])||'1x8')==='2x8'?1:0.5;
+    const eqOld=d=>getRegime(regimes,machine,d)==='2x8'?1:0.5;
 
-    // Upsert régime en DB
-    try{
-      await sb('machine_regime?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
-        {method:'DELETE',prefer:'return=minimal'});
-    }catch(e){}
-    await sb('machine_regime',{method:'POST',body:JSON.stringify({machine,date,mode:next}),prefer:'return=minimal'});
+    // Grille machine (jours fermés / samedis non ouverts exclus)
+    const msc=getMachineSubCols(machine);
+    const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
 
-    const dayRows=rows.filter(r=>r.machine===machine&&r.date===date);
-    if(dayRows.length===0){ loadPlanning(); return; }
+    const machRows=rows.filter(r=>r.machine===machine);
+    const allToDelete=[]; const allToInsert=[]; const anchoredPushed=[];
 
-    busyRef.current=true;
-    try{
-      const ofKeys=[...new Set(dayRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation+'§'+r.slot))];
-      const newRegimes={...regimes,[machine+'|'+date]:next};
-      const allToDelete=[];
-      const allToInsert=[];
+    // Re-simulation complète de chaque ligne (slot) de la machine :
+    // chaque OF est traité UNE seule fois. Il garde sa date de départ, sa durée
+    // est recalculée avec le nouveau régime (travail total en équipes inchangé).
+    // Les OF collés suivent ; un OF isolé (calé réception matière) ne bouge que
+    // s'il est percuté, et seulement après confirmation.
+    const slots=[...new Set(machRows.map(r=>r.slot))];
+    for(const slot of slots){
+      const ofMap={};
+      machRows.forEach(r=>{
+        if(r.slot!==slot) return;
+        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
+        if(mi===undefined) return; // ligne posée sur un jour fermé : on n'y touche pas
+        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
+        if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+        ofMap[k].rows.push({r,mi});
+        if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
+        if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
+      });
+      const groups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
 
-      for(const k of ofKeys){
-        const [ofn,cli,des,sl]=k.split('§');
-        const slot=parseInt(sl);
-        const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===ofn&&r.client===cli&&r.designation===des)
-          .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-        const oldDur=ofR.length;
-        const totalEq=ofR.reduce((sum,r)=>{
-          const m=getRegime(regimes,machine,r.date);
-          return sum+(m==='2x8'?1:0.5);
-        },0);
-        const startIdx=subColsMap.get(ofR[0].date+'|'+(ofR[0].half_day||1));
-        let eq=0,newDur=0;
-        for(let i=startIdx;i<subCols.length&&eq<totalEq;i++){
-          eq+=((newRegimes[machine+'|'+subCols[i].date])||'1x8')==='2x8'?1:0.5;
-          newDur++;
-        }
-        if(newDur===oldDur) continue;
-
-        if(next==='2x8'){
-          const freed=oldDur-newDur;
-          const oldLastIdx=subColsMap.get(ofR[ofR.length-1].date+'|'+(ofR[ofR.length-1].half_day||1));
-          const slotAfterOld=oldLastIdx+1;
-          ofR.slice(newDur).forEach(r=>allToDelete.push(r));
-          const adjacentRows=rows.filter(r=>{
-            if(r.machine!==machine||r.slot!==slot) return false;
-            if(r.of_number===ofn&&r.client===cli&&r.designation===des) return false;
-            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-            return ri>=slotAfterOld;
-          });
-          const isAdjacent=adjacentRows.some(r=>{
-            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-            return ri===slotAfterOld;
-          });
-          if(isAdjacent&&freed>0){
-            const ofMapPull={};
-            adjacentRows.forEach(r=>{
-              const rk=r.of_number+'§'+r.client+'§'+r.designation;
-              if(!ofMapPull[rk]) ofMapPull[rk]={rows:[],minIdx:Infinity};
-              const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-              ofMapPull[rk].rows.push({r,ri});
-              if(ri<ofMapPull[rk].minIdx) ofMapPull[rk].minIdx=ri;
-            });
-            const sorted=Object.values(ofMapPull).sort((a,b)=>a.minIdx-b.minIdx);
-            let pullEnd=slotAfterOld;
-            const toPull=[];
-            for(const grp of sorted){
-              if(grp.minIdx>pullEnd) break;
-              toPull.push(...grp.rows);
-              pullEnd=Math.max(pullEnd,...grp.rows.map(x=>x.ri+1));
-            }
-            toPull.forEach(({r})=>allToDelete.push(r));
-            toPull.forEach(({r,ri})=>{
-              const ni=ri-freed;
-              if(ni>=0&&ni<subCols.length){
-                const nc=subCols[ni];
-                const {id,...rest}=r;
-                allToInsert.push({...rest,date:nc.date,half_day:nc.hd});
-              }
-            });
-          }
-        } else {
-          // Grow
-          const last=ofR[ofR.length-1];
-          const lastIdx=subColsMap.get(last.date+'|'+(last.half_day||1));
-          const extra=newDur-oldDur;
-          const addSlots=[];
-          for(let i=1;i<=extra;i++){const ni=lastIdx+i;if(ni<subCols.length)addSlots.push(subCols[ni]);}
-          const ofMapR={};
-          rows.forEach(r=>{
-            if(r.machine!==machine||r.slot!==slot) return;
-            if(r.of_number===ofn&&r.client===cli&&r.designation===des) return;
-            const k2=r.of_number+'§'+r.client+'§'+r.designation;
-            if(!ofMapR[k2]) ofMapR[k2]={rows:[],minIdx:Infinity,maxIdx:-1};
-            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-            ofMapR[k2].rows.push(r);ofMapR[k2].minIdx=Math.min(ofMapR[k2].minIdx,ri);ofMapR[k2].maxIdx=Math.max(ofMapR[k2].maxIdx,ri);
-          });
-          const sortedG=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
-          const toShiftRows=[];
-          let pushEndR=lastIdx+extra+1;
-          for(const grp of sortedG){
-            if(grp.minIdx>=pushEndR) break;
-            if(grp.maxIdx<=lastIdx) continue;
-            grp.rows.forEach(r=>toShiftRows.push(r));
-            pushEndR=Math.max(pushEndR,grp.maxIdx+extra+1);
-          }
-          toShiftRows.forEach(r=>allToDelete.push(r));
-          toShiftRows.forEach(r=>{
-            const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-            if(ri<=lastIdx) return;
-            const ni=ri+extra;
-            if(ni<subCols.length){const nc=subCols[ni];const {id,...rest}=r;allToInsert.push({...rest,date:nc.date,half_day:nc.hd});}
-          });
-          addSlots.forEach(nc=>{const {id,...rest}=last;allToInsert.push({...rest,date:nc.date,half_day:nc.hd});});
+      let prevOrigEnd=-2, prevNewEnd=-1;
+      for(const grp of groups){
+        grp.rows.sort((a,b)=>a.mi-b.mi);
+        // Travail total en équipes, mesuré avec l'ANCIEN régime
+        const totalEq=grp.rows.reduce((sum,{r})=>sum+eqOld(r.date),0);
+        // Collé au groupe précédent -> il suit ; isolé -> il garde sa date
+        const glued=grp.minIdx===prevOrigEnd+1;
+        let ns=glued?prevNewEnd+1:grp.minIdx;
+        if(!glued&&ns<=prevNewEnd){ ns=prevNewEnd+1; anchoredPushed.push(grp); }
+        // Nouvelle durée avec le NOUVEAU régime, depuis la nouvelle position
+        let eq=0,nd=0;
+        for(let k=ns;k<msc.length&&eq<totalEq-1e-9;k++){ eq+=eqNew(msc[k].date); nd++; }
+        if(nd===0) nd=1;
+        prevOrigEnd=grp.maxIdx; prevNewEnd=ns+nd-1;
+        // Position et durée inchangées -> aucune écriture en base
+        const same= ns===grp.minIdx && nd===grp.rows.length &&
+          grp.rows.every(({mi},idx)=>mi===ns+idx);
+        if(same) continue;
+        grp.rows.forEach(({r})=>allToDelete.push(r));
+        for(let k=0;k<nd;k++){
+          const ni=ns+k;
+          if(ni>=msc.length) break;
+          const srcRow=grp.rows[Math.min(k,grp.rows.length-1)].r;
+          const {id,...rest}=srcRow;
+          allToInsert.push({...rest,date:msc[ni].date,half_day:msc[ni].hd});
         }
       }
+    }
 
-      // BULK DELETE
+    // ── 2. VALIDATION réception matière (avant toute écriture) ──
+    if(anchoredPushed.length>0){
+      const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
+      const okGo=window.confirm(
+        '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
+        'Le passage en '+(next==='2x8'?'2\u00d78':'1\u00d78')+' du '+date+' va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
+        noms+'\n\n'+
+        'OK = repousser quand même\nAnnuler = ne pas changer le régime'
+      );
+      if(!okGo){ showToast('Changement de régime annulé'); return; }
+    }
+
+    // ── 3. ÉCRITURE : régime + planning recalculé ──
+    setRegimes(r=>({...r,[machine+'|'+date]:next})); // UI optimiste
+    busyRef.current=true;
+    try{
+      try{
+        await sb('machine_regime?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
+          {method:'DELETE',prefer:'return=minimal'});
+      }catch(e){}
+      await sb('machine_regime',{method:'POST',body:JSON.stringify({machine,date,mode:next}),prefer:'return=minimal'});
+
       if(allToDelete.length>0){
         const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
         await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
       }
-      // BULK INSERT
+      let insertedRes=[];
       if(allToInsert.length>0){
-        await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=minimal'});
+        insertedRes=await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=representation'})||[];
       }
-
+      if(allToDelete.length>0||allToInsert.length>0){
+        pushHistory('Régime '+next+' '+machine+' '+date, {deleted:allToDelete, inserted:insertedRes});
+      }
+    }catch(e){
+      showToast('Erreur régime: '+e.message.slice(0,120));
     }finally{busyRef.current=false;}
     loadPlanning();
   }
@@ -2184,6 +2247,19 @@ function App(){
       {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
         onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
       {toast&&<div className="toast">{toast}</div>}
+      {syncPaused && !READONLY && (
+        <div style={{
+          position:'fixed', bottom:24, left:24, zIndex:300, maxWidth:340,
+          background:'#1a1916', border:'1px solid #c9a84c', color:'#f5f4f0',
+          padding:'11px 18px', borderRadius:6, fontSize:12, lineHeight:1.5,
+          fontFamily:"'IBM Plex Sans',sans-serif"
+        }}>
+          <b>⏸ Synchronisation automatique en pause</b><br/>
+          Les rafraîchissements ont lieu du lundi au vendredi, de 7h30 à 18h00.
+          Les données affichées peuvent ne plus être à jour — rechargez la page (F5)
+          pour forcer une mise à jour.
+        </div>
+      )}
     </div>
   );
 }
