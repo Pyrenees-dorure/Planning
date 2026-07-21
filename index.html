@@ -1029,50 +1029,73 @@ function App(){
           .map(([k])=>k.split('|')[1]));
         const slots=planHalfDays(halfDayCount, formData.date, startHD, sets, formData.machine, sat, null, openSatsForMachine, closedDaysForMachine);
 
-        // Cascade push : uniquement les OFs qui chevauchent les slots du nouvel OF
+        // ── Cascade — mêmes règles que déplacement/étirement/régime/samedi ──
         const msc=getMachineSubCols(formData.machine);
-        const mscMap=new Map(); msc.forEach((c,i)=>mscMap.set(c.date+'|'+c.hd,i));
-        const newMscSet=new Set(slots.map(s=>mscMap.get(s.date+'|'+s.half_day)).filter(i=>i!==undefined));
-        const newLen=slots.length;
+        const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
+        const newArr=[...new Set(slots.map(sl=>mscMap.get(sl.date+'|'+sl.half_day)).filter(x=>x!==undefined))].sort((a,b)=>a-b);
+        const newMin=newArr.length?newArr[0]:-1, newMax=newArr.length?newArr[newArr.length-1]:-2;
 
-        // Trouver les OFs conflictuels (entiers)
-        const conflictIds=new Set(rows
-          .filter(r=>r.machine===formData.machine&&r.slot===formData.slot&&newMscSet.has(mscMap.get(r.date+'|'+(r.half_day||1))))
-          .map(r=>r.id));
-        // Calculer conflictKeys UNE SEULE FOIS (pas dans chaque itération de filter)
-        const conflictKeys=conflictIds.size>0
-          ? new Set(rows.filter(x=>conflictIds.has(x.id)).map(x=>x.of_number+'§'+x.client+'§'+x.designation))
-          : new Set();
-        const toShiftC=conflictKeys.size>0 ? rows.filter(r=>{
-          if(r.machine!==formData.machine||r.slot!==formData.slot) return false;
-          return conflictKeys.has(r.of_number+'§'+r.client+'§'+r.designation);
-        }) : [];
+        // Occupation d'origine (détection OF isolés) + groupes d'OF de la ligne
+        const occupiedOrig=new Set();
+        const ofMapA={};
+        rows.forEach(r=>{
+          if(r.machine!==formData.machine||r.slot!==formData.slot) return;
+          const mi=mscMap.get(r.date+'|'+(r.half_day||1));
+          if(mi===undefined) return;
+          occupiedOrig.add(mi);
+          const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
+          if(!ofMapA[k]) ofMapA[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+          ofMapA[k].rows.push({r,mi});
+          if(mi<ofMapA[k].minIdx){ofMapA[k].minIdx=mi;ofMapA[k].date0=r.date;}
+          if(mi>ofMapA[k].maxIdx)ofMapA[k].maxIdx=mi;
+        });
+        const groupsA=Object.values(ofMapA).sort((a,b)=>a.minIdx-b.minIdx);
 
-        // CASCADE : bulk delete + bulk insert avec return=representation pour les IDs
-        let cascadeInserted=[];
-        if(toShiftC.length>0){
-          const ids=[...new Set(toShiftC.map(r=>r.id))].join(',');
-          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-          const shiftPayload=toShiftC.map(r=>{
-            const rmi=mscMap.get(r.date+'|'+(r.half_day||1));
-            if(rmi===undefined) return null;
-            const ni=rmi+newLen;
-            const nc=ni<msc.length?msc[ni]:null;
-            if(!nc) return null;
-            const {id,...rest}=r;
-            return {...rest,date:nc.date,half_day:nc.hd};
-          }).filter(Boolean);
-          if(shiftPayload.length>0){
-            const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
-            cascadeInserted=res||[];
+        const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
+        let nextFree=newMax+1;
+        for(const grp of groupsA){
+          if(grp.maxIdx<newMin) continue;      // entièrement avant le nouvel OF
+          if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
+          const offset=nextFree-grp.minIdx;
+          if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp); // OF isolé
+          pushedGroups.push(grp);
+          for(const {r,mi} of grp.rows){
+            const ni=mi+offset;
+            if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
           }
+          nextFree=grp.maxIdx+offset+1;
+        }
+
+        // ── VALIDATION réception matière (avant toute écriture) ──
+        if(anchoredPushed.length>0){
+          const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
+          const okGo=window.confirm(
+            '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
+            'L\u2019ajout de cet OF va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
+            noms+'\n\n'+
+            'OK = repousser quand même\nAnnuler = ne pas ajouter'
+          );
+          if(!okGo){showToast('Ajout annulé — OF calé sur réception matière');return;}
+        }
+
+        // CASCADE : bulk delete + bulk insert (IDs capturés pour Ctrl+Z)
+        const toDeleteRows=pushedGroups.flatMap(g=>g.rows.map(x=>x.r));
+        let cascadeInserted=[];
+        if(toDeleteRows.length>0){
+          const ids=[...new Set(toDeleteRows.map(r=>r.id))].join(',');
+          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+        }
+        if(shiftMoves.length>0){
+          const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
+          const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
+          cascadeInserted=res||[];
         }
 
         const payload=slots.map(s=>({...formData,date:s.date,half_day:s.half_day}));
         const inserted=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
         // Undo complet : supprime nouvel OF + cascadés insérés, restaure cascadés originaux
         pushHistory('Ajout '+formData.client, {
-          deleted: toShiftC,
+          deleted: toDeleteRows,
           inserted: [...(inserted||[]), ...cascadeInserted]
         });
         if(formData.client) await sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
@@ -1209,91 +1232,102 @@ function App(){
     const ofR=(knownRows||rows).filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
       .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
     const curLen=ofR.length;
-    if(newHalfDays===curLen){setModal(null);return;}
+    if(newHalfDays===curLen||curLen===0){setModal(null);return;}
     const last=ofR[ofR.length-1];
-    const lastIdx=subColsMap.get(last.date+'|'+(last.half_day||1));
-    const extra=newHalfDays-curLen; // positive = grow, negative = shrink
+    const extra=newHalfDays-curLen; // positif = étendre, négatif = réduire
 
     try{
       if(extra<0){
-        // Shrink: remove trailing slots
+        // Réduction : suppression des derniers créneaux (ne pousse personne)
         const toRemove=ofR.slice(newHalfDays);
         const ids=toRemove.map(r=>r.id).join(',');
         await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
         pushHistory('Réduit '+of_number, {deleted:toRemove, inserted:[]});
-        showToast('✓ Réduit à '+newHalfDays/2+' éq · Ctrl+Z pour annuler');
+        showToast('\u2713 Réduit à '+newHalfDays/2+' éq · Ctrl+Z pour annuler');
         setModal(null);loadPlanning();
         return;
       }
 
-      // Build new slots to add for growing OF — en utilisant les subCols de la machine (jours fermés exclus)
+      // ── Extension — tout en grille machine (jours fermés / samedis exclus) ──
       const msc=getMachineSubCols(machine);
-      const lastIdxMsc=msc.findIndex(c=>c.date===last.date&&c.hd===(last.half_day||1));
+      const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
+      const lastIdxMsc=mscMap.get(last.date+'|'+(last.half_day||1));
+      if(lastIdxMsc===undefined){showToast('Erreur resize: position introuvable');setModal(null);return;}
       const addSlots=[];
-      for(let i=1;i<=extra;i++){
-        const ni=lastIdxMsc+i;
+      for(let k=1;k<=extra;k++){
+        const ni=lastIdxMsc+k;
         if(ni<msc.length) addSlots.push(msc[ni]);
       }
 
-      // Only push OFs that actually overlap the new slots (respect free gaps)
-      const newIdxSet=new Set(addSlots.map((_,i)=>lastIdx+1+i));
-      // Build OF groups on same machine+slot
+      // Occupation d'origine (pour détecter les OF isolés) + groupes d'OF
+      const occupiedOrig=new Set();
       const ofMapR={};
       rows.forEach(r=>{
         if(r.machine!==machine||r.slot!==slot) return;
+        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
+        if(mi===undefined) return;
+        occupiedOrig.add(mi);
         if(r.of_number===of_number&&r.client===client&&r.designation===designation) return;
-        const k=r.of_number+'§'+r.client+'§'+r.designation;
-        if(!ofMapR[k]) ofMapR[k]={rows:[],minIdx:Infinity,maxIdx:-1};
-        const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-        ofMapR[k].rows.push(r); ofMapR[k].minIdx=Math.min(ofMapR[k].minIdx,ri); ofMapR[k].maxIdx=Math.max(ofMapR[k].maxIdx,ri);
+        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
+        if(!ofMapR[k]) ofMapR[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+        ofMapR[k].rows.push({r,mi});
+        if(mi<ofMapR[k].minIdx){ofMapR[k].minIdx=mi;ofMapR[k].date0=r.date;}
+        if(mi>ofMapR[k].maxIdx)ofMapR[k].maxIdx=mi;
       });
-      const sortedGroupsR=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
+      const groups=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
 
-      // Cascade push via msc (machine subCols)
-      const mscMap=new Map(); msc.forEach((c,i)=>mscMap.set(c.date+'|'+c.hd,i));
-      const toShiftRows=[];
-      let pushEndR=lastIdxMsc+extra+1;
-      for(const grp of sortedGroupsR){
-        const grpMinMsc=Math.min(...grp.rows.map(r=>mscMap.get(r.date+'|'+(r.half_day||1))??Infinity));
-        const grpMaxMsc=Math.max(...grp.rows.map(r=>mscMap.get(r.date+'|'+(r.half_day||1))??-1));
-        if(grpMinMsc>=pushEndR) break;
-        if(grpMaxMsc<=lastIdxMsc) continue;
-        grp.rows.forEach(r=>toShiftRows.push(r));
-        pushEndR=Math.max(pushEndR, grpMaxMsc+extra+1);
+      // ── Cascade minimale : mêmes règles que le déplacement ──
+      const newMin=lastIdxMsc+1, newMax=lastIdxMsc+extra;
+      const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
+      let nextFree=newMax+1;
+      for(const grp of groups){
+        if(grp.maxIdx<newMin) continue;      // entièrement avant la zone étendue
+        if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
+        const offset=nextFree-grp.minIdx;
+        if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp); // OF isolé
+        pushedGroups.push(grp);
+        for(const {r,mi} of grp.rows){
+          const ni=mi+offset;
+          if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
+        }
+        nextFree=grp.maxIdx+offset+1;
       }
 
-      const shiftMoves=toShiftRows.map(r=>{
-        const ri=mscMap.get(r.date+'|'+(r.half_day||1));
-        if(ri===undefined||ri<=lastIdxMsc) return null;
-        const ni=ri+extra;
-        return {r, nc: ni<msc.length ? msc[ni] : null};
-      }).filter(m=>m&&m.nc!==null);
-      const toShift=toShiftRows;
+      // ── VALIDATION réception matière (avant toute écriture) ──
+      if(anchoredPushed.length>0){
+        const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
+        const okGo=window.confirm(
+          '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
+          'Cette extension va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
+          noms+'\n\n'+
+          'OK = repousser quand même\nAnnuler = ne pas étendre'
+        );
+        if(!okGo){showToast('Extension annulée — OF calé sur réception matière');setModal(null);return;}
+      }
 
-      // ATOMIC: delete all shifted rows, bulk reinsert at new positions, bulk add new OF slots
+      // ── EXÉCUTION ATOMIQUE ──
       const actualInserted=[];
-      if(toShiftRows.length>0){
-        const ids=toShiftRows.map(r=>r.id).join(',');
+      const toDeleteRows=pushedGroups.flatMap(g=>g.rows.map(x=>x.r));
+      if(toDeleteRows.length>0){
+        const ids=[...new Set(toDeleteRows.map(r=>r.id))].join(',');
         await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
       }
-      // Bulk INSERT décalés
       if(shiftMoves.length>0){
         const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
         const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
         if(res) actualInserted.push(...res);
       }
-      // Bulk INSERT nouveaux slots OF
       if(addSlots.length>0){
         const addPayload=addSlots.map(nc=>({machine,date:nc.date,half_day:nc.hd,slot,
           of_number,client,designation,mac:last.mac,qte:last.qte,
-          format:last.format||'',depart:last.depart,conducteur:last.conducteur,bold:last.bold}));
+          format:last.format||'',depart:last.depart,conducteur:last.conducteur,bold:last.bold,
+          ...(last.of_id?{of_id:last.of_id}:{})}));
         const res=await sb('planning',{method:'POST',body:JSON.stringify(addPayload),prefer:'return=representation'});
         if(res) actualInserted.push(...res);
       }
 
-      const nPushed=new Set(toShiftRows.map(r=>r.of_number+'§'+r.client+'§'+r.designation)).size;
-      pushHistory('Redimensionnement '+of_number, {deleted:toShiftRows, inserted:actualInserted});
-      showToast('✓ Étendu à '+newHalfDays/2+' éq'+(nPushed?' · '+nPushed+' OF repoussé(s)':'') +' · Ctrl+Z pour annuler');
+      pushHistory('Redimensionnement '+of_number, {deleted:toDeleteRows, inserted:actualInserted});
+      showToast('\u2713 Étendu à '+newHalfDays/2+' éq'+(pushedGroups.length?' · '+pushedGroups.length+' OF repoussé(s)':'') +' · Ctrl+Z pour annuler');
       setModal(null);loadPlanning();
     }catch(e){showToast('Erreur resize: '+e.message);}
   }
