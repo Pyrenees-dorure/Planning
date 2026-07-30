@@ -329,15 +329,33 @@ function inWorkWindow(d){
 
 // Colonnes réellement utilisées par l'app (évite select=* qui rapatrie tout).
 // Repli automatique sur "*" si une colonne n'existe pas encore en base.
-var PLANNING_COLS = 'id,date,machine,slot,half_day,of_number,client,designation,mac,qte,format,depart,conducteur,bold,of_id';
+var PLANNING_COLS = 'id,date,machine,slot,half_day,of_number,client,designation,mac,qte,format,depart,conducteur,bold';
+
+// ⚠ IMPORTANT : l'API Supabase plafonne chaque réponse (1000 lignes par défaut).
+// Sans pagination, dès que la table dépasse ce plafond, les lignes en FIN de tri
+// sont silencieusement coupées — et comme le tri sur `date` est textuel, ce sont
+// les jours 30 et 31 du mois qui disparaissent en premier (trous fantômes au
+// 31/07, 31/08…, erreurs à l'ajout, OF décalés par les recalculs de régime).
+// sbAll récupère TOUTES les lignes en paginant. Le chemin DOIT avoir un tri stable.
+async function sbAll(pathBase){
+  var PAGE=1000, all=[], from=0;
+  for(;;){
+    var sep=pathBase.indexOf('?')>=0?'&':'?';
+    var b=await sb(pathBase+sep+'limit='+PAGE+'&offset='+from);
+    all=all.concat(b||[]);
+    if(!b||b.length<PAGE) return all;
+    from+=PAGE;
+  }
+}
+
 async function sbPlanning(){
   try{
-    return await sb('planning?order=date,machine,slot,half_day&select='+PLANNING_COLS);
+    return await sbAll('planning?order=date,machine,slot,half_day&select='+PLANNING_COLS);
   }catch(e){
     if(PLANNING_COLS !== '*'){
       console.warn('[PDD] select explicite refusé, repli sur select=* :', e.message);
       PLANNING_COLS = '*';
-      return await sb('planning?order=date,machine,slot,half_day&select=*');
+      return await sbAll('planning?order=date,machine,slot,half_day&select=*');
     }
     throw e;
   }
@@ -427,7 +445,7 @@ function App(){
     try{
       const [data,cliData,regData,satData,closureData,opData,opAssignData]=await Promise.all([
         sbPlanning(),
-        sb('clients?order=nom&select=nom'),
+        sbAll('clients?order=nom&select=nom'),
         sb('machine_regime?select=machine,date,mode'),
         sb('saturday_config?select=date,machines'),
         sb('machine_closure?select=machine,date'),
@@ -505,7 +523,7 @@ function App(){
     // On préfixe backup_date avec "M|" pour identifier les sauvegardes manuelles
     const labelKey='M|'+dateKey+'|'+hhmm;
     try{
-      const data=await sb('planning?order=date,machine,slot,half_day&select=*');
+      const data=await sbAll('planning?order=date,machine,slot,half_day&select=*');
       const payload={backup_date:labelKey, created_at:now.toISOString(), snapshot:JSON.stringify(data||[])};
       await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
       return true;
@@ -525,7 +543,7 @@ function App(){
       if(!data||data.length===0) throw new Error('Sauvegarde introuvable');
       const snapshot=JSON.parse(data[0].snapshot);
       // 1. Récupérer tous les ids existants puis supprimer par lots
-      const existing=await sb('planning?select=id');
+      const existing=await sbAll('planning?select=id&order=id');
       if(existing&&existing.length>0){
         const deleteChunkSize=200;
         for(let i=0;i<existing.length;i+=deleteChunkSize){
