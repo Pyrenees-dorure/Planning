@@ -1377,13 +1377,8 @@ function App(){
 
     const allToDelete=[]; const allToInsert=[]; const anchoredPushed=[];
 
-    // ⚠ OUVERTURE d'un samedi : AUCUN OF n'est déplacé.
-    // Le samedi ouvert reste un créneau LIBRE — il ne « tire » plus vers l'arrière
-    // la chaîne d'OF collés qui suit. On le remplit manuellement (glisser-déposer,
-    // étirement, ajout) : dans ces opérations le samedi ouvert reste un jour comme un autre.
-    // La FERMETURE conserve le comportement historique (décalage + cascade).
-    for(const machine of newlyRemoved){
-      const opened=false;
+    for(const machine of [...newlyAdded,...newlyRemoved]){
+      const opened=newlyAdded.includes(machine);
       const oldMsc=machineCols(machine,!opened);
       const newMsc=machineCols(machine,opened);
       const oldMap=new Map(); oldMsc.forEach((c,k)=>oldMap.set(c.date+'|'+c.hd,k));
