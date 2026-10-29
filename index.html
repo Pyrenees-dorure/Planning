@@ -9,6 +9,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
@@ -28,6 +29,8 @@ body{background:#f5f4f0;color:#1a1916;font-family:'IBM Plex Sans',sans-serif;fon
 .lbl{font-size:10px;color:#8a8880;text-transform:uppercase;letter-spacing:.5px;font-family:'IBM Plex Mono',monospace;margin-bottom:4px;display:block;}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
 .frow{margin-bottom:13px;}
+.dov{box-shadow:inset 0 0 0 2px #8a6a20 !important;}
+.cell-e.dov{background:#edf5e0 !important;}
 .toast{position:fixed;bottom:24px;right:24px;background:#1a1916;border:1px solid #c9a84c;color:#f5f4f0;padding:11px 18px;border-radius:6px;font-size:12px;z-index:300;animation:fadeIn .2s ease;}
 </style>
 </head>
@@ -266,6 +269,300 @@ async function sb(path,opts){
 }
 function loadS(){try{return JSON.parse(localStorage.getItem('pdd4')||'{}');}catch(e){return{};}}
 function saveS(s){localStorage.setItem('pdd4',JSON.stringify(s));}
+
+// ─── MOTEUR DE PLANIFICATION (fonctions pures, sans accès base) ──────────────
+// Chaque planificateur renvoie {remove:[lignes existantes à supprimer],
+// add:[lignes à insérer, sans id], anchored:[OF calés repoussés], ...}.
+// Règle : un OF « terminé » n'est JAMAIS déplacé par une cascade ; les OF
+// repoussés le contournent.
+
+function ofKeyOf(r){return r.of_id?('#'+r.of_id):((r.of_number||'')+'§'+(r.client||'')+'§'+(r.designation||''));}
+function sameOfPred(src){
+  if(src.of_id) return function(r){return r.of_id===src.of_id;};
+  return function(r){return r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation;};
+}
+function cellKey(r){return r.machine+'|'+r.date+'|'+(r.half_day||1)+'|'+r.slot;}
+function stripId(r){var o={};for(var k in r){if(k!=='id')o[k]=r[k];}return o;}
+function colIndexMap(cols){var m=new Map();cols.forEach(function(c,k){m.set(c.date+'|'+c.hd,k);});return m;}
+
+// Index du créneau (date,hd) dans cols, ou du premier créneau ouvert suivant (-1 si aucun)
+function idxAtOrAfter(cols,map,date,hd){
+  var d=map.get(date+'|'+hd);
+  if(d!==undefined) return d;
+  var t=pd(date).getTime();
+  for(var k=0;k<cols.length;k++){
+    var ct=pd(cols[k].date).getTime();
+    if(ct>t||(ct===t&&cols[k].hd>=hd)) return k;
+  }
+  return -1;
+}
+
+// Groupes d'OF d'une ligne (machine+slot), positions = indices dans cols
+function buildGroups(rows,machine,slot,map,exclude){
+  var gm={};
+  rows.forEach(function(r){
+    if(r.machine!==machine||r.slot!==slot) return;
+    if(exclude&&exclude(r)) return;
+    var mi=map.get(r.date+'|'+(r.half_day||1));
+    if(mi===undefined) return;
+    var k=ofKeyOf(r);
+    if(!gm[k]) gm[k]={key:k,rows:[],minIdx:Infinity,maxIdx:-1,done:false,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
+    var g=gm[k];
+    g.rows.push({r:r,mi:mi});
+    if(getDone(r)) g.done=true;
+    if(mi<g.minIdx){g.minIdx=mi;g.date0=r.date;}
+    if(mi>g.maxIdx) g.maxIdx=mi;
+  });
+  var arr=Object.keys(gm).map(function(k){gm[k].rows.sort(function(a,b){return a.mi-b.mi;});return gm[k];});
+  arr.sort(function(a,b){return a.minIdx-b.minIdx;});
+  return arr;
+}
+function occupiedSet(rows,machine,slot,map){
+  var s=new Set();
+  rows.forEach(function(r){
+    if(r.machine!==machine||r.slot!==slot) return;
+    var mi=map.get(r.date+'|'+(r.half_day||1));
+    if(mi!==undefined) s.add(mi);
+  });
+  return s;
+}
+function overlapFixed(a,b,fixed){
+  for(var i=0;i<fixed.length;i++){if(a<=fixed[i][1]&&b>=fixed[i][0]) return fixed[i];}
+  return null;
+}
+// Premier début >= s tel que [s, s+len-1] ne chevauche aucun OF terminé
+function fitAfter(s,len,fixed){
+  var moved=true;
+  while(moved){
+    moved=false;
+    for(var i=0;i<fixed.length;i++){
+      if(s<=fixed[i][1]&&s+len-1>=fixed[i][0]){s=fixed[i][1]+1;moved=true;}
+    }
+  }
+  return s;
+}
+function moveRow(r,col,extra){var o=stripId(r);o.date=col.date;o.half_day=col.hd;if(extra)for(var k in extra)o[k]=extra[k];return o;}
+
+// Insère le bloc [newMin,newMax] sur une ligne en repoussant le minimum
+// nécessaire ; les OF terminés restent fixes.
+function cascadePush(groups,newMin,newMax,cols,occupied){
+  var fixed=groups.filter(function(g){return g.done;}).map(function(g){return [g.minIdx,g.maxIdx];});
+  var hit=overlapFixed(newMin,newMax,fixed);
+  if(hit){
+    var g0=groups.find(function(g){return g.done&&g.minIdx===hit[0];});
+    return {blocked:g0};
+  }
+  var remove=[],add=[],anchored=[],pushed=[],lost=0;
+  var nextFree=newMax+1;
+  for(var i=0;i<groups.length;i++){
+    var g=groups[i];
+    if(g.done) continue;
+    if(g.maxIdx<newMin) continue;
+    if(g.minIdx>=nextFree) break;
+    var ns=fitAfter(nextFree,g.maxIdx-g.minIdx+1,fixed);
+    var off=ns-g.minIdx;
+    if(!occupied.has(g.minIdx-1)) anchored.push(g);
+    pushed.push(g);
+    g.rows.forEach(function(x){
+      remove.push(x.r);
+      var ni=x.mi+off;
+      if(ni<cols.length) add.push(moveRow(x.r,cols[ni])); else lost++;
+    });
+    nextFree=g.maxIdx+off+1;
+  }
+  return {remove:remove,add:add,anchored:anchored,pushed:pushed,lost:lost};
+}
+
+// ── Déplacement (glisser-déposer) ──
+// p: {rows, src, tMachine, tSlot, tDate, tHD, cols (grille machine cible), regimes}
+function planDrop(p){
+  var rows=p.rows,src=p.src,cols=p.cols,map=colIndexMap(cols);
+  var isSame=sameOfPred(src);
+  var ofR=rows.filter(function(r){return r.machine===src.machine&&r.slot===src.slot&&isSame(r);})
+    .sort(function(a,b){return pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1);});
+  if(!ofR.length) return {noop:true};
+  var tgt=idxAtOrAfter(cols,map,p.tDate,p.tHD);
+  if(tgt<0) return {error:'Dépôt impossible : aucun créneau ouvert pour '+p.tMachine+' à cette date'};
+  var sameMachine=p.tMachine===src.machine;
+  var moves=[];
+  if(sameMachine){
+    var sIdx=idxAtOrAfter(cols,map,src.date,src.half_day||1);
+    if(sIdx<0) return {noop:true};
+    var diff=tgt-sIdx;
+    if(diff===0&&p.tSlot===src.slot) return {noop:true};
+    var used=new Set();
+    ofR.forEach(function(r){
+      var ri=idxAtOrAfter(cols,map,r.date,r.half_day||1);
+      if(ri<0) return;
+      var ni=ri+diff;
+      while(used.has(ni)) ni++;
+      if(ni>=0&&ni<cols.length){used.add(ni);moves.push({r:r,ni:ni});}
+    });
+  } else {
+    var totalEq=ofR.reduce(function(s,r){return s+(getRegime(p.regimes,src.machine,r.date)==='2x8'?1:0.5);},0);
+    var eq=0,k=tgt;
+    while(k<cols.length&&eq<totalEq-1e-9){
+      eq+=(getRegime(p.regimes,p.tMachine,cols[k].date)==='2x8'?1:0.5);
+      moves.push({r:ofR[Math.min(moves.length,ofR.length-1)],ni:k});
+      k++;
+    }
+  }
+  if(!moves.length) return {noop:true};
+  var idxs=moves.map(function(m){return m.ni;});
+  var newMin=Math.min.apply(null,idxs),newMax=Math.max.apply(null,idxs);
+  var occupied=occupiedSet(rows,p.tMachine,p.tSlot,map);
+  var groups=buildGroups(rows,p.tMachine,p.tSlot,map,function(r){return r.machine===src.machine&&r.slot===src.slot&&isSame(r);});
+  var c=cascadePush(groups,newMin,newMax,cols,occupied);
+  if(c.blocked) return {blocked:c.blocked};
+  var add=c.add.concat(moves.map(function(m){return moveRow(m.r,cols[m.ni],{machine:p.tMachine,slot:p.tSlot});}));
+  return {remove:ofR.concat(c.remove),add:add,anchored:c.anchored,pushed:c.pushed,lost:c.lost};
+}
+
+// ── Ajout d'un OF ── p:{rows, newRows (sans id), machine, slot, cols}
+function planAdd(p){
+  var map=colIndexMap(p.cols);
+  var idxs=p.newRows.map(function(r){return map.get(r.date+'|'+(r.half_day||1));}).filter(function(x){return x!==undefined;});
+  if(!idxs.length) return {remove:[],add:p.newRows.slice(),anchored:[],pushed:[]};
+  var newMin=Math.min.apply(null,idxs),newMax=Math.max.apply(null,idxs);
+  var occupied=occupiedSet(p.rows,p.machine,p.slot,map);
+  var groups=buildGroups(p.rows,p.machine,p.slot,map,null);
+  var c=cascadePush(groups,newMin,newMax,p.cols,occupied);
+  if(c.blocked) return {blocked:c.blocked};
+  return {remove:c.remove,add:c.add.concat(p.newRows),anchored:c.anchored,pushed:c.pushed,lost:c.lost};
+}
+
+// ── Redimensionnement ── p:{rows, first (une ligne de l'OF), newLen (demi-j), cols}
+function planResize(p){
+  var isSame=sameOfPred(p.first);
+  var m=p.first.machine,slot=p.first.slot;
+  var ofR=p.rows.filter(function(r){return r.machine===m&&r.slot===slot&&isSame(r);})
+    .sort(function(a,b){return pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1);});
+  var cur=ofR.length;
+  if(!cur||p.newLen===cur) return {noop:true};
+  if(p.newLen<cur) return {remove:ofR.slice(p.newLen),add:[],anchored:[],pushed:[],reduced:true};
+  var map=colIndexMap(p.cols);
+  var last=ofR[cur-1];
+  var li=map.get(last.date+'|'+(last.half_day||1));
+  if(li===undefined) return {error:'Position de l\'OF introuvable'};
+  var extra=p.newLen-cur;
+  var adds=[];
+  for(var k=1;k<=extra;k++){if(li+k<p.cols.length) adds.push(moveRow(last,p.cols[li+k]));}
+  var occupied=occupiedSet(p.rows,m,slot,map);
+  var groups=buildGroups(p.rows,m,slot,map,function(r){return isSame(r);});
+  var c=cascadePush(groups,li+1,li+extra,p.cols,occupied);
+  if(c.blocked) return {blocked:c.blocked};
+  return {remove:c.remove,add:c.add.concat(adds),anchored:c.anchored,pushed:c.pushed,lost:c.lost};
+}
+
+// ── Recalcul d'une machine quand sa grille change (samedi ouvert/fermé,
+//    jour de fermeture). OF collé -> suit ; OF isolé -> garde sa date ;
+//    OF terminé -> ne bouge pas. ──
+function planResim(rows,machine,oldCols,newCols){
+  var oldMap=colIndexMap(oldCols),newMap=colIndexMap(newCols);
+  var remove=[],add=[],anchored=[];
+  var mRows=rows.filter(function(r){return r.machine===machine;});
+  var slots=Array.from(new Set(mRows.map(function(r){return r.slot;})));
+  slots.forEach(function(slot){
+    var groups=buildGroups(mRows,machine,slot,oldMap,null);
+    var fixed=[];
+    groups.forEach(function(g){
+      if(!g.done) return;
+      var ids=g.rows.map(function(x){return newMap.get(x.r.date+'|'+(x.r.half_day||1));}).filter(function(v){return v!==undefined;});
+      if(ids.length) fixed.push([Math.min.apply(null,ids),Math.max.apply(null,ids)]);
+    });
+    var prevOrigEnd=-2,prevNewEnd=-1;
+    groups.forEach(function(g){
+      if(g.done){
+        var ids=g.rows.map(function(x){return newMap.get(x.r.date+'|'+(x.r.half_day||1));}).filter(function(v){return v!==undefined;});
+        prevOrigEnd=g.maxIdx;
+        if(ids.length) prevNewEnd=Math.max(prevNewEnd,Math.max.apply(null,ids));
+        return;
+      }
+      var first=g.rows[0].r;
+      var glued=g.minIdx===prevOrigEnd+1;
+      var own=idxAtOrAfter(newCols,newMap,first.date,first.half_day||1);
+      var ns=glued?prevNewEnd+1:own;
+      if(ns<0) ns=prevNewEnd+1;
+      if(!glued&&ns<=prevNewEnd) ns=prevNewEnd+1;
+      var nd=g.rows.length;
+      ns=fitAfter(ns,nd,fixed);
+      if(!glued&&own>=0&&ns>own) anchored.push(g);
+      prevOrigEnd=g.maxIdx; prevNewEnd=ns+nd-1;
+      var same=g.rows.every(function(x,i){var ni=ns+i;return ni<newCols.length&&newCols[ni].date===x.r.date&&newCols[ni].hd===(x.r.half_day||1);});
+      if(same) return;
+      g.rows.forEach(function(x,i){
+        remove.push(x.r);
+        var ni=ns+i;
+        if(ni>=0&&ni<newCols.length) add.push(moveRow(x.r,newCols[ni]));
+      });
+    });
+  });
+  return {remove:remove,add:add,anchored:anchored};
+}
+
+// ── Changement de régime 1×8 / 2×8 : chaque OF garde sa date de départ et
+//    son travail total en équipes ; durée recalculée. OF terminé : fixe. ──
+function planRegime(rows,machine,cols,regimesOld,regimesNew){
+  var map=colIndexMap(cols);
+  var eqOld=function(d){return getRegime(regimesOld,machine,d)==='2x8'?1:0.5;};
+  var eqNew=function(d){return getRegime(regimesNew,machine,d)==='2x8'?1:0.5;};
+  var remove=[],add=[],anchored=[];
+  var mRows=rows.filter(function(r){return r.machine===machine;});
+  var slots=Array.from(new Set(mRows.map(function(r){return r.slot;})));
+  slots.forEach(function(slot){
+    var groups=buildGroups(mRows,machine,slot,map,null);
+    var fixed=groups.filter(function(g){return g.done;}).map(function(g){return [g.minIdx,g.maxIdx];});
+    var prevOrigEnd=-2,prevNewEnd=-1;
+    groups.forEach(function(g){
+      if(g.done){prevOrigEnd=g.maxIdx;prevNewEnd=Math.max(prevNewEnd,g.maxIdx);return;}
+      var totalEq=g.rows.reduce(function(s,x){return s+eqOld(x.r.date);},0);
+      var glued=g.minIdx===prevOrigEnd+1;
+      var ns=glued?prevNewEnd+1:g.minIdx;
+      var pushedFlag=false;
+      if(!glued&&ns<=prevNewEnd){ns=prevNewEnd+1;pushedFlag=true;}
+      var nd=0;
+      for(var guard=0;guard<50;guard++){
+        var eq=0;nd=0;
+        for(var k=ns;k<cols.length&&eq<totalEq-1e-9;k++){eq+=eqNew(cols[k].date);nd++;}
+        if(nd===0) nd=1;
+        var hit=overlapFixed(ns,ns+nd-1,fixed);
+        if(!hit) break;
+        ns=hit[1]+1; pushedFlag=true;
+      }
+      if(pushedFlag&&!glued) anchored.push(g);
+      prevOrigEnd=g.maxIdx; prevNewEnd=ns+nd-1;
+      var same=ns===g.minIdx&&nd===g.rows.length&&g.rows.every(function(x,i){return x.mi===ns+i;});
+      if(same) return;
+      g.rows.forEach(function(x){remove.push(x.r);});
+      for(var j=0;j<nd;j++){
+        var ni=ns+j;
+        if(ni>=cols.length) break;
+        add.push(moveRow(g.rows[Math.min(j,g.rows.length-1)].r,cols[ni]));
+      }
+    });
+  });
+  return {remove:remove,add:add,anchored:anchored};
+}
+
+// Composition de deux diffs successifs (édition puis redimensionnement)
+// d1 s'applique d'abord. Les lignes de d1.add portent un id provisoire.
+function composeDiff(d1,d2){
+  var addedIds=new Set(d1.add.map(function(r){return r.id;}));
+  var rm2=new Set(d2.remove.map(function(r){return r.id;}));
+  return {
+    remove:d1.remove.concat(d2.remove.filter(function(r){return !addedIds.has(r.id);})),
+    add:d1.add.filter(function(r){return !rm2.has(r.id);}).map(stripId).concat(d2.add.map(stripId))
+  };
+}
+
+function anchoredMessage(list,action){
+  var noms=list.map(function(g){return '• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0;}).join('\n');
+  return '⚠ ATTENTION — RÉCEPTION MATIÈRE\n\n'+action+' va repousser '+list.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+noms+'\n\nCes OF sont normalement calés sur une date de réception de matière.\n\nOK = repousser quand même\nAnnuler = ne rien faire';
+}
+function blockedMessage(g){
+  return 'Créneau occupé par un OF terminé ('+(g.of_number?g.of_number+' — ':'')+g.client+'), qui reste fixe.';
+}
+
 </script>
 
 <script type="text/babel">
@@ -317,15 +614,6 @@ function mkBands(machine, slot, subCols, lkp){
   return bands;
 }
 
-// ─── OPTIMISATION BANDE PASSANTE ─────────────────────────────────────────
-// Fenêtre de rafraîchissement automatique : lundi → vendredi, 07:30 → 18:00
-function inWorkWindow(d){
-  d = d || new Date();
-  var day = d.getDay();                 // 0 = dimanche, 6 = samedi
-  if(day === 0 || day === 6) return false;
-  var mins = d.getHours()*60 + d.getMinutes();
-  return mins >= (7*60+30) && mins <= (18*60);
-}
 
 // Colonnes réellement utilisées par l'app (évite select=* qui rapatrie tout).
 // Repli automatique sur "*" si une colonne n'existe pas encore en base.
@@ -361,19 +649,54 @@ async function sbPlanning(){
   }
 }
 
+
+// ─── TEMPS RÉEL + HISTORIQUE ─────────────────────────────────────────────
+var RT_AUX_TABLES=['machine_regime','machine_closure','saturday_config','operator_assignments','operators'];
+var HIST_MAX=30;
+var _tmpSeq=0;
+
+async function sbDeleteIds(ids){
+  for(let i=0;i<ids.length;i+=150){
+    const part=ids.slice(i,i+150).join(',');
+    await sb('planning?id=in.('+part+')',{method:'DELETE',prefer:'return=minimal'});
+  }
+}
+async function sbInsertRows(rowsArr){
+  let out=[];
+  for(let i=0;i<rowsArr.length;i+=400){
+    const res=await sb('planning',{method:'POST',body:JSON.stringify(rowsArr.slice(i,i+400)),prefer:'return=representation'});
+    out=out.concat(res||[]);
+  }
+  return out;
+}
+function mondayOf(d){const x=new Date(d);x.setHours(0,0,0,0);const w=(x.getDay()+6)%7;x.setDate(x.getDate()-w);return x;}
+function historyStart(){const d=new Date();d.setDate(d.getDate()-28);return mondayOf(d);}
+
+// Plage de dates affichables : du plus ancien OF (ou 4 semaines avant aujourd'hui)
+// jusqu'à +1 an (ou au dernier OF), samedis ouverts inclus.
+function computeDates(rowsArr, sc){
+  let start=historyStart();
+  let ext=new Date(); ext.setFullYear(ext.getFullYear()+1);
+  (rowsArr||[]).forEach(r=>{const d=pd(r.date);if(d<start)start=new Date(d);if(d>ext)ext=new Date(d);});
+  const all=new Set();
+  const cur=new Date(start);
+  while(cur<=ext){if(isWD(cur,false))all.add(fd(cur));cur.setDate(cur.getDate()+1);}
+  Object.keys(sc||{}).forEach(d=>{if((sc[d]||[]).length>0)all.add(d);});
+  return [...all].sort((a,b)=>pd(a)-pd(b));
+}
+
 function App(){
   const [rows,setRows]=useState([]);
   const [regimes,setRegimes]=useState({});
   const [satConfigs,setSatConfigs]=useState({});
-  const [closures,setClosures]=useState({}); // key: machine|date → true
+  const [closures,setClosures]=useState({});
   const [clients,setClients]=useState([]);
-  const [operators,setOperators]=useState([]); // [{id,nom,abrev,color,archived}]
-  const [opAssign,setOpAssign]=useState({}); // key: machine|date|half_day → operator_id
+  const [operators,setOperators]=useState([]);
+  const [opAssign,setOpAssign]=useState({});
   const [showOperators,setShowOperators]=useState(false);
   const [showBackups,setShowBackups]=useState(false);
-  // previewData: {rows, backupId, backupDate} — mode aperçu snapshot (lecture seule)
   const [previewData,setPreviewData]=useState(null);
-  const [satModal,setSatModal]=useState(null); // {date, machines:[]}
+  const [satModal,setSatModal]=useState(null);
   const [dates,setDates]=useState([]);
   const [loading,setLoading]=useState(true);
   const [q,setQ]=useState('');
@@ -381,67 +704,68 @@ function App(){
   const [showSet,setShowSet]=useState(false);
   const [showClients,setShowClients]=useState(false);
   const [sets,setSets]=useState(()=>loadS());
-  const [dragSrc,setDragSrc]=useState(null);
-  const [resizeSrc,setResizeSrc]=useState(null); // {band, slot, machine, startX, origDur, origLastIdx}
-  const [dragOver,setDragOver]=useState(null);
-  const [readonlyPopup,setReadonlyPopup]=useState(null); // {band, x, y}
+  const [resizeSrc,setResizeSrc]=useState(null);
+  const [readonlyPopup,setReadonlyPopup]=useState(null);
   const [toast,setToast]=useState(null);
+  const [showHistory,setShowHistory]=useState(false);
+  const [opPicker,setOpPicker]=useState(null);
+  const [rtStatus,setRtStatus]=useState('connecting');
+  const [histTick,setHistTick]=useState(0);
   const tRef=useRef();
   const gridRef=useRef();
-  const busyRef=useRef(false); // true during mutations — pause auto-sync
-  const justResizedRef=useRef(false); // bloque onClick après un resize
-  const sat=false; // Saturdays managed via satModal
-  const [hdw, setHdw] = useState(50); // half-day column width (zoom)
+  const busyRef=useRef(false);
+  const justResizedRef=useRef(false);
+  const dragSrcRef=useRef(null);
+  const dragElRef=useRef(null);
+  const dragOverElRef=useRef(null);
+  const histRef=useRef({undo:[],redo:[]});
+  const idMapRef=useRef(new Map());
+  const rtBufRef=useRef([]);
+  const rtTimerRef=useRef(null);
+  const auxPendingRef=useRef(false);
+  const scrollAnchorRef=useRef(null);
+  const sat=false;
+  const [hdw, setHdw] = useState(50);
   const zoomIn  = ()=>setHdw(v=>Math.min(v+10, 120));
   const zoomOut = ()=>setHdw(v=>Math.max(v-10,  24));
 
-  function showToast(msg){setToast(msg);clearTimeout(tRef.current);tRef.current=setTimeout(()=>setToast(null),3200);}
+  // Références toujours à jour (pour les gestionnaires appelés hors rendu)
+  const rowsRef=useRef(rows); rowsRef.current=rows;
+  const regRef=useRef(regimes); regRef.current=regimes;
+  const satRef=useRef(satConfigs); satRef.current=satConfigs;
+  const closRef=useRef(closures); closRef.current=closures;
+  const opAssignRef=useRef(opAssign); opAssignRef.current=opAssign;
+  const datesRef=useRef(dates); datesRef.current=dates;
+
+  function showToast(msg){setToast(msg);clearTimeout(tRef.current);tRef.current=setTimeout(()=>setToast(null),3600);}
   function upd(s){setSets(s);saveS(s);}
 
-  async function loadPlanning(){
-    // Rechargement léger après mutations (planning + régimes seulement)
-    const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
+  function applyAuxData(regData,closureData,satData,opData,opAssignData,rowsArr){
+    const rm={};(regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});setRegimes(rm);
+    const cl={};(closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});setClosures(cl);
+    setOperators(opData||[]);
+    const oa={};(opAssignData||[]).forEach(r=>{oa[r.machine+'|'+r.date+'|'+r.half_day]=r.operator_id;});setOpAssign(oa);
+    if(satData){
+      const sc={};satData.forEach(r=>{sc[r.date]=r.machines||[];});setSatConfigs(sc);
+      setDates(computeDates(rowsArr||rowsRef.current,sc));
+    }
+  }
+
+  async function loadAux(){
     try{
-      const [data,regData,closureData,opData,opAssignData]=await Promise.all([
-        sbPlanning(),
+      const [regData,closureData,satData,opData,opAssignData]=await Promise.all([
         sb('machine_regime?select=machine,date,mode'),
         sb('machine_closure?select=machine,date'),
+        sb('saturday_config?select=date,machines'),
         sb('operators?select=id,nom,abrev,color,archived'),
-        sb('operator_assignments?select=machine,date,half_day,operator_id'),
+        sbAll('operator_assignments?select=machine,date,half_day,operator_id&order=machine,date,half_day'),
       ]);
-      const rm={};
-      (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
-      setRegimes(rm);
-      setOperators(opData||[]);
-      const oa={};
-      (opAssignData||[]).forEach(r=>{oa[r.machine+'|'+r.date+'|'+r.half_day]=r.operator_id;});
-      setOpAssign(oa);
-      const cl={};
-      (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
-      setClosures(cl);
-      const r=data||[];
-      setRows(r);
-      // Recalcul dates si un OF dépasse la plage
-      const startYear=new Date().getFullYear();
-      const start=new Date(startYear,2,23);
-      let ext=new Date(); ext.setFullYear(ext.getFullYear()+1);
-      if(r.length>0){
-        const srt=[...new Set(r.map(x=>x.date))].sort((a,b)=>pd(a)-pd(b));
-        const lastOf=pd(srt[srt.length-1]);
-        if(lastOf>ext) ext=new Date(lastOf);
-      }
-      const allD=new Set();
-      let cur=new Date(start);
-      while(cur<=ext){if(isWD(cur,sat))allD.add(fd(cur));cur.setDate(cur.getDate()+1);}
-      Object.keys(satConfigs||{}).forEach(d=>{if((satConfigs[d]||[]).length>0)allD.add(d);});
-      setDates([...allD].sort((a,b)=>pd(a)-pd(b)));
-      if(savedScroll!==null) setTimeout(()=>{if(gridRef.current)gridRef.current.scrollLeft=savedScroll;},30);
+      applyAuxData(regData,closureData,satData,opData,opAssignData);
     }catch(e){showToast('Erreur: '+e.message);}
   }
 
+  // Rechargement complet (démarrage, erreur, reconnexion)
   async function load(){
-    // Chargement complet (initial + auto-sync + après changement satConfig/clients)
-    const savedScroll=gridRef.current ? gridRef.current.scrollLeft : null;
     try{
       const [data,cliData,regData,satData,closureData,opData,opAssignData]=await Promise.all([
         sbPlanning(),
@@ -450,62 +774,27 @@ function App(){
         sb('saturday_config?select=date,machines'),
         sb('machine_closure?select=machine,date'),
         sb('operators?select=id,nom,abrev,color,archived'),
-        sb('operator_assignments?select=machine,date,half_day,operator_id'),
+        sbAll('operator_assignments?select=machine,date,half_day,operator_id&order=machine,date,half_day'),
       ]);
-      const sc={};
-      (satData||[]).forEach(r=>{sc[r.date]=r.machines||[];});
-      setSatConfigs(sc);
-      const cl={};
-      (closureData||[]).forEach(r=>{cl[r.machine+'|'+r.date]=true;});
-      setClosures(cl);
-      setClients((cliData||[]).map(c=>c.nom));
-      setOperators(opData||[]);
-      const oa={};
-      (opAssignData||[]).forEach(r=>{oa[r.machine+'|'+r.date+'|'+r.half_day]=r.operator_id;});
-      setOpAssign(oa);
-      const rm={};
-      (regData||[]).forEach(r=>{rm[r.machine+'|'+r.date]=r.mode;});
-      setRegimes(rm);
       const r=data||[];
+      rtBufRef.current=[]; // les données fraîches remplacent les événements en attente
       setRows(r);
-      const allD=new Set();
-      const startYear=new Date().getFullYear();
-      let start=new Date(startYear, 2, 23);
-      let ext=new Date(); ext.setFullYear(ext.getFullYear()+1);
-      if(r.length>0){
-        const srt=[...new Set(r.map(x=>x.date))].sort((a,b)=>pd(a)-pd(b));
-        const lastOf=pd(srt[srt.length-1]);
-        if(lastOf>ext) ext=new Date(lastOf);
-      }
-      let cur=new Date(start);
-      while(cur<=ext){if(isWD(cur,sat))allD.add(fd(cur));cur.setDate(cur.getDate()+1);}
-      Object.keys(sc||{}).forEach(d=>{if((sc[d]||[]).length>0)allD.add(d);});
-      const sortedDates_=[...allD].sort((a,b)=>pd(a)-pd(b));
-      setDates(sortedDates_);
-      if(!scrolledRef.current){
-        const todayIdx=sortedDates_.indexOf(fd(new Date()));
-        if(todayIdx>=0) initialScrollIdx.current=todayIdx;
-      } else if(savedScroll!==null){
-        setTimeout(()=>{if(gridRef.current) gridRef.current.scrollLeft=savedScroll;}, 30);
-      }
-      if(loading) setLoading(false); // seulement au premier chargement
-      return r; // retourne les rows pour éviter un double-fetch au démarrage
-    }catch(e){showToast('Erreur: '+e.message);if(loading) setLoading(false);}
+      setClients((cliData||[]).map(c=>c.nom));
+      applyAuxData(regData,closureData,satData||[],opData,opAssignData,r);
+      setLoading(false);
+      return r;
+    }catch(e){showToast('Erreur: '+e.message);setLoading(false);}
   }
+  const loadPlanning=load;
 
   // ─── DAILY BACKUP ─────────────────────────────────────────────────────────
-  // Crée automatiquement un snapshot quotidien au premier chargement du jour.
-  // Stocke dans Supabase table `planning_backups` (créée si besoin via upsert).
-  // Si la table n'existe pas encore, la sauvegarde est silencieusement ignorée.
   async function createDailyBackup(planningData){
-    const dateKey=fd(new Date()); // dd/mm/yy
+    const dateKey=fd(new Date());
     try{
-      // Vérifie si une sauvegarde existe déjà aujourd'hui
       const existing=await sb('planning_backups?backup_date=eq.'+encodeURIComponent(dateKey)+'&select=id').catch(()=>null);
-      if(existing && existing.length>0) return; // déjà fait aujourd'hui
+      if(existing && existing.length>0) return;
       const payload={backup_date:dateKey, created_at:new Date().toISOString(), snapshot:JSON.stringify(planningData)};
       await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'}).catch(()=>null);
-      // Purge : ne garder que les 60 derniers jours (tri par created_at ISO = tri chronologique fiable)
       const old=await sb('planning_backups?select=id,created_at&order=created_at.asc').catch(()=>null);
       if(old && old.length>60){
         const toDelete=old.slice(0,old.length-60);
@@ -513,21 +802,18 @@ function App(){
           await sb('planning_backups?id=eq.'+b.id,{method:'DELETE',prefer:'return=minimal'}).catch(()=>null);
         }
       }
-    }catch(e){/* silencieux — la table peut ne pas encore exister */}
+    }catch(e){}
   }
 
   async function createManualBackup(){
     const now=new Date();
     const dateKey=fd(now);
     const hhmm=now.toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
-    // On préfixe backup_date avec "M|" pour identifier les sauvegardes manuelles
     const labelKey='M|'+dateKey+'|'+hhmm;
-    try{
-      const data=await sbAll('planning?order=date,machine,slot,half_day&select=*');
-      const payload={backup_date:labelKey, created_at:now.toISOString(), snapshot:JSON.stringify(data||[])};
-      await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-      return true;
-    }catch(e){throw e;}
+    const data=await sbAll('planning?order=date,machine,slot,half_day&select=*');
+    const payload={backup_date:labelKey, created_at:now.toISOString(), snapshot:JSON.stringify(data||[])};
+    await sb('planning_backups',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+    return true;
   }
 
   async function loadBackups(){
@@ -538,132 +824,264 @@ function App(){
   }
 
   async function restoreBackup(backupId){
+    busyRef.current=true;
     try{
       const data=await sb('planning_backups?id=eq.'+backupId+'&select=snapshot');
       if(!data||data.length===0) throw new Error('Sauvegarde introuvable');
       const snapshot=JSON.parse(data[0].snapshot);
-      // 1. Récupérer tous les ids existants puis supprimer par lots
       const existing=await sbAll('planning?select=id&order=id');
-      if(existing&&existing.length>0){
-        const deleteChunkSize=200;
-        for(let i=0;i<existing.length;i+=deleteChunkSize){
-          const ids=existing.slice(i,i+deleteChunkSize).map(r=>r.id).join(',');
-          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-        }
-      }
-      // 2. Réinsérer par lots de 200 (snapshots peuvent être grands)
-      const chunkSize=200;
-      for(let i=0;i<snapshot.length;i+=chunkSize){
-        const chunk=snapshot.slice(i,i+chunkSize).map(({id,...rest})=>rest);
+      if(existing&&existing.length>0) await sbDeleteIds(existing.map(r=>r.id));
+      for(let i=0;i<snapshot.length;i+=200){
+        const chunk=snapshot.slice(i,i+200).map(stripId);
         await sb('planning',{method:'POST',body:JSON.stringify(chunk),prefer:'return=minimal'});
       }
+      // Les identifiants ont tous changé : l'historique Ctrl+Z n'est plus valable
+      histRef.current={undo:[],redo:[]}; idMapRef.current=new Map(); setHistTick(t=>t+1);
       return true;
-    }catch(e){throw e;}
+    }finally{busyRef.current=false;}
   }
-  // ─── END DAILY BACKUP ─────────────────────────────────────────────────────
 
   const modalOpenRef=useRef(false);
-  useEffect(()=>{modalOpenRef.current=!!modal;},[modal]);
-
+  useEffect(()=>{modalOpenRef.current=!!modal||!!satModal;},[modal,satModal]);
   const previewDataRef=useRef(null);
   useEffect(()=>{previewDataRef.current=previewData;},[previewData]);
 
-  // ─── AUTO-SYNC ÉCONOME EN BANDE PASSANTE ────────────────────────────────
-  // Consultation (?readonly=1) : sync toutes les 5 min.
-  // Édition : pas d'auto-sync périodique — chaque action recharge déjà les
-  // données, et le retour sur l'onglet déclenche une resynchro.
-  // Dans les deux cas : pause si onglet caché, pause hors lun-ven 7h30-18h00.
-  const SYNC_MS = 300000;
-  const [syncPaused, setSyncPaused] = useState(!inWorkWindow());
-
-  useEffect(()=>{
-    load().then(planningRows=>{
-      // Snapshot quotidien automatique — réutilise les données déjà chargées
-      if(planningRows) createDailyBackup(planningRows);
+  // ─── HISTORIQUE (Ctrl+Z / Ctrl+Y) ────────────────────────────────────────
+  // Chaque action enregistre : lignes supprimées, lignes créées, et les
+  // changements annexes (régime, samedi, fermeture, opérateurs).
+  // Comme la base attribue de nouveaux identifiants à chaque réinsertion,
+  // idMap suit la correspondance ancien id -> id actuel.
+  function resolveId(id){const m=idMapRef.current;let g=0;while(m.has(id)&&g<1000){id=m.get(id);g++;}return id;}
+  function mapIds(origRows,newRows){
+    const byCell=new Map(newRows.map(r=>[cellKey(r),r]));
+    origRows.forEach(o=>{
+      if(o.id===undefined||o.id===null) return;
+      const n=byCell.get(cellKey(o));
+      if(n){const from=resolveId(o.id);if(from!==n.id)idMapRef.current.set(from,n.id);}
     });
+  }
+  function pushHistory(entry){
+    const h=histRef.current;
+    h.undo=[...h.undo.slice(-(HIST_MAX-1)),entry];
+    h.redo=[];
+    setHistTick(t=>t+1);
+  }
 
-    const canSync = ()=> !busyRef.current && !modalOpenRef.current && !previewDataRef.current;
-    const lastSync = { t: Date.now() };
-
-    const tick = ()=>{
-      if(document.visibilityState !== 'visible') return;   // onglet caché / écran en veille
-      if(!inWorkWindow()){ setSyncPaused(true); return; }  // hors plage de travail
-      setSyncPaused(false);
-      if(canSync()){ lastSync.t = Date.now(); load(); }
-    };
-    const t = READONLY ? setInterval(tick, SYNC_MS) : null;
-
-    // Retour sur l'onglet : resynchro immédiate, 1 fois par minute maximum
-    const onVis = ()=>{
-      if(document.visibilityState !== 'visible') return;
-      if(!inWorkWindow()){ setSyncPaused(true); return; }
-      setSyncPaused(false);
-      if(Date.now() - lastSync.t < 60000) return;
-      if(canSync()){ lastSync.t = Date.now(); load(); }
-    };
-    document.addEventListener('visibilitychange', onVis);
-
-    // Réévalue l'état "en pause" toutes les minutes (pour le bandeau)
-    const tw = setInterval(()=>{ setSyncPaused(!inWorkWindow()); }, 60000);
-
-    return()=>{
-      if(t) clearInterval(t); clearInterval(tw);
-      document.removeEventListener('visibilitychange', onVis);
-    };
-  },[sat]);
-
-  // scrolledRef tracks whether we've done the initial scroll to today
-  const scrolledRef=useRef(false);
-  const initialScrollIdx=useRef(-1);
-
-  // Scroll instantané dès que le grid est rendu (useLayoutEffect = avant paint)
-  useLayoutEffect(()=>{
-    if(!loading && !scrolledRef.current && initialScrollIdx.current>=0 && gridRef.current){
-      gridRef.current.scrollLeft=Math.max(0, LW+(initialScrollIdx.current*2-5)*hdw-80);
-      scrolledRef.current=true;
-      initialScrollIdx.current=-1;
+  // Changements annexes : application en base
+  async function applyAuxDB(aux,dir){
+    const side=(dir==='before'||dir==='undo')?'before':'after';
+    for(const a of aux||[]){
+      const v=a[side];
+      if(a.type==='regime'){
+        await sb('machine_regime?machine=eq.'+encodeURIComponent(a.machine)+'&date=eq.'+encodeURIComponent(a.date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
+        await sb('machine_regime',{method:'POST',body:JSON.stringify({machine:a.machine,date:a.date,mode:v}),prefer:'return=minimal'});
+      } else if(a.type==='sat'){
+        await sb('saturday_config?date=eq.'+encodeURIComponent(a.date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
+        if(v&&v.length>0) await sb('saturday_config',{method:'POST',body:JSON.stringify({date:a.date,machines:v}),prefer:'return=minimal'});
+      } else if(a.type==='closure'){
+        await sb('machine_closure?machine=eq.'+encodeURIComponent(a.machine)+'&date=eq.'+encodeURIComponent(a.date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
+        if(v) await sb('machine_closure',{method:'POST',body:JSON.stringify({machine:a.machine,date:a.date}),prefer:'return=minimal'});
+      } else if(a.type==='op'){
+        await Promise.all(a.items.map(it=>sb('operator_assignments?machine=eq.'+encodeURIComponent(it.machine)+'&date=eq.'+encodeURIComponent(it.date)+'&half_day=eq.'+it.half_day,{method:'DELETE',prefer:'return=minimal'}).catch(()=>{})));
+        const payload=a.items.filter(it=>it[side]!=null).map(it=>({machine:it.machine,date:it.date,half_day:it.half_day,operator_id:it[side]}));
+        if(payload.length) await sb('operator_assignments',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
+      }
     }
-  },[loading,dates]);
-  // Undo history: stack of {label, deleted:[], inserted:[]}
-  const historyRef=useRef([]);
-
-  function pushHistory(label, snapshot){
-    historyRef.current=[...historyRef.current.slice(-19), {label, snapshot}];
+  }
+  // Changements annexes : application à l'écran (immédiate)
+  function applyAuxLocal(aux,dir){
+    const side=(dir==='before'||dir==='undo')?'before':'after';
+    for(const a of aux||[]){
+      const v=a[side];
+      if(a.type==='regime'){
+        setRegimes(r=>({...r,[a.machine+'|'+a.date]:v}));
+      } else if(a.type==='sat'){
+        const sc={...satRef.current,[a.date]:v||[]};
+        satRef.current=sc;
+        setSatConfigs(sc);
+        setDates(computeDates(rowsRef.current,sc));
+      } else if(a.type==='closure'){
+        setClosures(c=>{const n={...c};if(v)n[a.machine+'|'+a.date]=true;else delete n[a.machine+'|'+a.date];return n;});
+      } else if(a.type==='op'){
+        setOpAssign(o=>{const n={...o};a.items.forEach(it=>{const k=it.machine+'|'+it.date+'|'+it.half_day;if(it[side]==null)delete n[k];else n[k]=it[side];});return n;});
+      }
+    }
   }
 
-  async function undo(){
-    const h=historyRef.current;
-    if(h.length===0){showToast('Rien à annuler');return;}
-    const last=h[h.length-1];
-    historyRef.current=h.slice(0,-1);
+  // Écriture planning : suppression puis insertion, avec remise en place si
+  // l'insertion échoue.
+  async function dbApply(removeRows,addRows){
+    const rmIds=[...new Set(removeRows.map(r=>r.id))];
+    if(rmIds.length) await sbDeleteIds(rmIds);
+    if(!addRows.length) return [];
     try{
-      if(last.snapshot.inserted.length>0){
-        const ids=last.snapshot.inserted.map(r=>r.id).join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
+      return await sbInsertRows(addRows.map(stripId));
+    }catch(e){
+      if(rmIds.length){
+        try{const back=await sbInsertRows(removeRows.map(stripId));mapIds(removeRows,back);}catch(e2){}
       }
-      if(last.snapshot.deleted.length>0){
-        const payload=last.snapshot.deleted.map(({id,...rest})=>rest);
-        await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-      }
-      showToast('↩ Annulé : '+last.label);
-      loadPlanning();
-    }catch(e){showToast('Erreur annulation: '+e.message);}
+      throw e;
+    }
   }
 
-  // Ctrl+Z listener
+  // Exécute une action : affichage immédiat, enregistrement en arrière-plan,
+  // inscription dans l'historique. En cas d'erreur, rechargement complet.
+  async function commit({label,remove=[],add=[],aux=[],toastMsg,light}){
+    if(!light&&busyRef.current){showToast('Enregistrement en cours… réessayez dans un instant');return false;}
+    if(!light) busyRef.current=true;
+    const tmp=add.map(r=>({...stripId(r),id:'tmp_'+(++_tmpSeq)}));
+    const rmSet=new Set(remove.map(r=>r.id));
+    if(remove.length||tmp.length) setRows(prev=>prev.filter(r=>!rmSet.has(r.id)).concat(tmp));
+    if(aux.length) applyAuxLocal(aux,'after');
+    try{
+      if(aux.length) await applyAuxDB(aux,'after');
+      let inserted=[];
+      try{
+        inserted=await dbApply(remove,add);
+      }catch(e){
+        if(aux.length){try{await applyAuxDB(aux,'before');}catch(e2){}}
+        throw e;
+      }
+      if(tmp.length||inserted.length){
+        const tmpIds=new Set(tmp.map(r=>r.id)); const insIds=new Set(inserted.map(r=>r.id));
+        setRows(prev=>prev.filter(r=>!tmpIds.has(r.id)&&!insIds.has(r.id)).concat(inserted));
+      }
+      pushHistory({label,deleted:remove,inserted,aux});
+      if(toastMsg) showToast(toastMsg);
+      return true;
+    }catch(e){
+      showToast('Erreur : '+String(e.message||e).slice(0,120)+' — planning rechargé');
+      await load();
+      return false;
+    }finally{
+      if(!light) busyRef.current=false;
+      flushRt();
+    }
+  }
+
+  async function runHistory(dir){
+    if(READONLY||previewDataRef.current) return;
+    const h=histRef.current;
+    const stack=dir==='undo'?h.undo:h.redo;
+    if(!stack.length){showToast(dir==='undo'?'Rien à annuler':'Rien à rétablir');return;}
+    if(busyRef.current){showToast('Enregistrement en cours… réessayez dans un instant');return;}
+    const e=stack[stack.length-1];
+    const toRemove=dir==='undo'?e.inserted:e.deleted;
+    const toAdd=dir==='undo'?e.deleted:e.inserted;
+    // Contrôle : les lignes à retirer sont-elles toujours là, inchangées ?
+    const cur=new Map(rowsRef.current.map(r=>[r.id,r]));
+    const removeNow=[]; let conflict=false;
+    toRemove.forEach(r=>{
+      const c=cur.get(resolveId(r.id));
+      if(!c||c.machine!==r.machine||c.date!==r.date||(c.half_day||1)!==(r.half_day||1)) conflict=true;
+      else removeNow.push(c);
+    });
+    const rmSet=new Set(removeNow.map(r=>r.id));
+    const occ=new Set(rowsRef.current.filter(r=>!rmSet.has(r.id)).map(cellKey));
+    toAdd.forEach(r=>{if(occ.has(cellKey(r)))conflict=true;});
+    if(conflict){
+      stack.pop(); setHistTick(t=>t+1);
+      showToast((dir==='undo'?'Annulation':'Rétablissement')+' impossible pour « '+e.label+' » : le planning a été modifié entre-temps (autre poste).');
+      return;
+    }
+    busyRef.current=true;
+    const tmp=toAdd.map(r=>({...stripId(r),id:'tmp_'+(++_tmpSeq)}));
+    setRows(prev=>prev.filter(r=>!rmSet.has(r.id)).concat(tmp));
+    applyAuxLocal(e.aux,dir);
+    try{
+      await applyAuxDB(e.aux,dir);
+      const ins=await dbApply(removeNow,toAdd);
+      mapIds(toAdd,ins);
+      const tmpIds=new Set(tmp.map(r=>r.id)); const insIds=new Set(ins.map(r=>r.id));
+      setRows(prev=>prev.filter(r=>!tmpIds.has(r.id)&&!insIds.has(r.id)).concat(ins));
+      stack.pop();
+      (dir==='undo'?h.redo:h.undo).push(e);
+      setHistTick(t=>t+1);
+      showToast(dir==='undo'?'↩ Annulé : '+e.label+' · Ctrl+Y pour rétablir':'↪ Rétabli : '+e.label);
+    }catch(err){
+      showToast('Erreur : '+String(err.message||err).slice(0,120)+' — planning rechargé');
+      await load();
+    }finally{
+      busyRef.current=false;
+      flushRt();
+    }
+  }
+  const undo=()=>runHistory('undo');
+  const redo=()=>runHistory('redo');
+
+  // ─── TEMPS RÉEL ──────────────────────────────────────────────────────────
+  // Les modifications des autres postes arrivent ligne par ligne et sont
+  // appliquées sans recharger le planning. Pendant un enregistrement local,
+  // elles sont mises en attente puis appliquées.
+  function flushRt(){
+    if(busyRef.current) return;
+    if(auxPendingRef.current){auxPendingRef.current=false;loadAux();}
+    const evs=rtBufRef.current;
+    if(!evs.length) return;
+    rtBufRef.current=[];
+    setRows(prev=>{
+      const m=new Map(prev.map(r=>[r.id,r]));
+      evs.forEach(ev=>{
+        if(ev.eventType==='DELETE'){if(ev.old&&ev.old.id!=null)m.delete(ev.old.id);}
+        else if(ev.new&&ev.new.id!=null) m.set(ev.new.id,ev.new);
+      });
+      return [...m.values()];
+    });
+  }
+
   useEffect(()=>{
-    function onKey(e){if((e.ctrlKey||e.metaKey)&&e.key==='z'){e.preventDefault();undo();}}
+    load().then(planningRows=>{if(planningRows) createDailyBackup(planningRows);});
+    if(!window.supabase||!window.supabase.createClient){setRtStatus('off');return;}
+    const client=window.supabase.createClient(SB,KEY,{auth:{persistSession:false,autoRefreshToken:false}});
+    let wasLost=false, auxTimer=null;
+    const scheduleRows=()=>{clearTimeout(rtTimerRef.current);rtTimerRef.current=setTimeout(()=>H.current.flushRt(),150);};
+    let ch=client.channel('pdd-planning')
+      .on('postgres_changes',{event:'*',schema:'public',table:'planning'},p=>{rtBufRef.current.push(p);scheduleRows();});
+    RT_AUX_TABLES.forEach(t=>{
+      ch=ch.on('postgres_changes',{event:'*',schema:'public',table:t},()=>{
+        clearTimeout(auxTimer);
+        auxTimer=setTimeout(()=>{auxPendingRef.current=true;H.current.flushRt();},400);
+      });
+    });
+    ch.subscribe(status=>{
+      if(status==='SUBSCRIBED'){
+        setRtStatus('live');
+        if(wasLost){wasLost=false;if(!busyRef.current)H.current.load();}
+      } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        setRtStatus('off'); wasLost=true;
+      }
+    });
+    // Retour sur l'onglet alors que le temps réel est coupé : resynchronisation
+    let lastFull=Date.now();
+    const onVis=()=>{
+      if(document.visibilityState!=='visible') return;
+      if(H.current.rtStatus==='live') return;
+      if(Date.now()-lastFull<60000||busyRef.current||modalOpenRef.current||previewDataRef.current) return;
+      lastFull=Date.now(); H.current.load();
+    };
+    document.addEventListener('visibilitychange',onVis);
+    return()=>{document.removeEventListener('visibilitychange',onVis);client.removeChannel(ch);};
+  },[]);
+
+  // Ctrl+Z / Ctrl+Y (ignorés dans les champs de saisie et fenêtres ouvertes)
+  useEffect(()=>{
+    function onKey(e){
+      if(!(e.ctrlKey||e.metaKey)) return;
+      const t=e.target, tag=(t&&t.tagName)||'';
+      if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(t&&t.isContentEditable)) return;
+      if(modalOpenRef.current) return;
+      const k=(e.key||'').toLowerCase();
+      if(k==='z'&&!e.shiftKey){e.preventDefault();H.current.undo();}
+      else if(k==='y'||(k==='z'&&e.shiftKey)){e.preventDefault();H.current.redo();}
+    }
     window.addEventListener('keydown',onKey);
     return()=>window.removeEventListener('keydown',onKey);
   },[]);
 
-  // En mode aperçu snapshot, on substitue rows par previewData.rows
-  // On étend aussi dates pour couvrir les éventuelles dates du snapshot hors plage actuelle
+  // ─── GRILLE ──────────────────────────────────────────────────────────────
   const activeRows=previewData?previewData.rows:rows;
-
   const activeDates=useMemo(()=>{
     if(!previewData) return dates;
-    // Ajouter les dates du snapshot qui seraient hors de la plage courante
     const extra=new Set(previewData.rows.map(r=>r.date).filter(d=>!dates.includes(d)));
     if(extra.size===0) return dates;
     return [...new Set([...dates,...extra])].sort((a,b)=>pd(a)-pd(b));
@@ -671,983 +1089,506 @@ function App(){
 
   const lkp=useMemo(()=>{
     const m={};
-    activeRows.forEach(r=>{
-      const hd=r.half_day||1;
-      m[r.machine+'|'+r.date+'|'+hd+'|'+r.slot]=r;
-    });
+    activeRows.forEach(r=>{m[r.machine+'|'+r.date+'|'+(r.half_day||1)+'|'+r.slot]=r;});
     return m;
   },[activeRows]);
 
-  const subCols=useMemo(()=>buildSubCols(activeDates,sat),[activeDates,sat]);
+  const subCols=useMemo(()=>buildSubCols(activeDates,sat),[activeDates]);
+  const subColsMap=useMemo(()=>{const m=new Map();subCols.forEach((sc,i)=>m.set(sc.date+'|'+sc.hd,i));return m;},[subCols]);
 
-  // Map date|hd → index pour lookups O(1)
-  const subColsMap=useMemo(()=>{
-    const m=new Map();
-    subCols.forEach((sc,i)=>m.set(sc.date+'|'+sc.hd,i));
-    return m;
-  },[subCols]);
-
-  // SubCols filtrés par machine (samedis fermés exclus), memoïsés
-  const machineSubColsCache=useMemo(()=>{
-    const cache={};
-    MACHINES.forEach(machine=>{
-      cache[machine]=subCols.filter(sc=>{
-        const dow=pd(sc.date).getDay();
-        if(dow===6) return (satConfigs[sc.date]||[]).includes(machine);
-        if(closures[machine+'|'+sc.date]) return false; // jour fermé
-        return true;
-      });
+  // Grille d'une machine (samedis non ouverts et jours fermés exclus)
+  function machineColsFor(machine,sc,cl){
+    sc=sc||satRef.current; cl=cl||closRef.current;
+    const all=new Set(datesRef.current);
+    Object.keys(sc).forEach(d=>{if((sc[d]||[]).length)all.add(d);});
+    const out=[];
+    [...all].sort((a,b)=>pd(a)-pd(b)).forEach(d=>{
+      if(pd(d).getDay()===6&&!((sc[d]||[]).includes(machine))) return;
+      if(cl[machine+'|'+d]) return;
+      out.push({date:d,hd:1});out.push({date:d,hd:2});
     });
-    return cache;
-  },[subCols,satConfigs,closures]);
-
-  function getMachineSubCols(machine){
-    return machineSubColsCache[machine]||subCols;
+    return out;
   }
 
-  // Fermer une machine pour une journée entière
-  async function saveClosure(machine, date){
-    busyRef.current=true;
-    try{
-      // 1. Enregistrer la fermeture
-      await sb('machine_closure',{method:'POST',body:JSON.stringify({machine,date}),prefer:'return=minimal'});
-      const newClosures={...closures,[machine+'|'+date]:true};
-      setClosures(newClosures);
-
-      // 2. Décaler les OFs affectés (comme pour le samedi fermé)
-      // Construire extCols avec le jour, extColsNoClose sans
-      const allDatesSet=new Set(dates);
-      const extCols=[...allDatesSet].sort((a,b)=>pd(a)-pd(b)).flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
-      const extColsNo=[...allDatesSet].filter(d=>!(newClosures[machine+'|'+d])).sort((a,b)=>pd(a)-pd(b)).flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
-      const closeI=extCols.findIndex(c=>c.date===date&&c.hd===1);
-
-      const toShift=rows.filter(r=>{
-        if(r.machine!==machine) return false;
-        const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-        return ri>=closeI;
-      });
-      if(toShift.length>0){
-        const ids=toShift.map(r=>r.id).join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-        const payload=toShift.map(r=>{
-          const ri=extCols.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          // Trouver la même position dans extColsNo (le jour fermé disparaît → slots se décalent)
-          // On cherche la position équivalente en ignorant les jours fermés
-          const noI=extColsNo.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          if(noI<0) return null; // slot sur jour fermé → sera déplacé au prochain dispo
-          const {id,...rest}=r;
-          return {...rest,date:extColsNo[noI]?.date||r.date,half_day:extColsNo[noI]?.hd||r.half_day};
-        }).filter(Boolean);
-        if(payload.length>0) await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-      }
-    }catch(e){showToast('Erreur fermeture: '+e.message);}
-    finally{busyRef.current=false;}
-    loadPlanning();
-  }
-
-  async function openClosure(machine, date){
-    busyRef.current=true;
-    try{
-      // Construire les subCols AVANT réouverture (jour encore fermé)
-      const allDatesArr=[...new Set(dates)].sort((a,b)=>pd(a)-pd(b));
-      const extColsOld=allDatesArr
-        .filter(d=>!closures[machine+'|'+d]) // état actuel : jour fermé exclu
-        .flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
-
-      // Supprimer la fermeture en DB
-      await sb('machine_closure?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
-        {method:'DELETE',prefer:'return=minimal'});
-      const newClosures={...closures};
-      delete newClosures[machine+'|'+date];
-      setClosures(newClosures);
-
-      // Construire les subCols APRÈS réouverture (jour inclus)
-      const extColsNew=allDatesArr
-        .filter(d=>!newClosures[machine+'|'+d])
-        .flatMap(d=>[{date:d,hd:1},{date:d,hd:2}]);
-
-      // Premier slot APRÈS la date réouverte dans extColsOld
-      const firstAfterOld=extColsOld.findIndex(c=>pd(c.date)>pd(date));
-      if(firstAfterOld<0){} // rien après → pas de décalage
-      else{
-        const toShift=rows.filter(r=>{
-          if(r.machine!==machine) return false;
-          const ri=extColsOld.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-          return ri>=firstAfterOld;
-        });
-        if(toShift.length>0){
-          const ids=toShift.map(r=>r.id).join(',');
-          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-          const payload=toShift.map(r=>{
-            // Position ri dans extColsOld → extColsNew[ri] = 2 slots plus tôt (le jour réouvert s'insère avant)
-            const ri=extColsOld.findIndex(c=>c.date===r.date&&c.hd===(r.half_day||1));
-            const nc=extColsNew[ri];
-            if(!nc) return null;
-            const {id,...rest}=r;
-            return {...rest,date:nc.date,half_day:nc.hd};
-          }).filter(Boolean);
-          if(payload.length>0)
-            await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-        }
-      }
-    }catch(e){showToast('Erreur ouverture: '+e.message);}
-    finally{busyRef.current=false;}
-    loadPlanning();
-  }
-
-  // filter dates by search
+  const histStartDate=historyStart();
   const filteredDates=useMemo(()=>{
-    if(!q)return activeDates;
+    let base=activeDates;
+    if(!showHistory&&!q&&!previewData) base=base.filter(d=>pd(d)>=histStartDate);
+    if(!q) return base;
     const ql=q.toLowerCase();
-    return activeDates.filter(d=>activeRows.some(r=>r.date===d&&(
+    const hit=new Set(activeRows.filter(r=>
       (r.client||'').toLowerCase().includes(ql)||(r.of_number||'').toLowerCase().includes(ql)||(r.designation||'').toLowerCase().includes(ql)
-    )));
-  },[activeDates,activeRows,q]);
+    ).map(r=>r.date));
+    return base.filter(d=>hit.has(d));
+  },[activeDates,activeRows,q,showHistory,previewData,histStartDate.getTime()]);
 
-  const filteredSubCols=useMemo(()=>buildSubCols(filteredDates,sat),[filteredDates,sat]);
+  const filteredSubCols=useMemo(()=>buildSubCols(filteredDates,sat),[filteredDates]);
 
-  // DRAG — useCallback pour éviter recréation à chaque render
-  const onDS=useCallback((e,row)=>{setDragSrc(row);e.dataTransfer.effectAllowed='move';},[]);
-  const onDO=useCallback((e,key)=>{e.preventDefault();setDragOver(key);},[]);
-  const onDL=useCallback(()=>setDragOver(null),[]);
-
-  // Bandes memoïsées par machine (ne recalcule que si lkp ou filteredSubCols change)
   const bandsPerMachine=useMemo(()=>{
     const res={};
     MACHINES.forEach(machine=>{res[machine]=mkBands(machine,1,filteredSubCols,lkp);});
     return res;
   },[lkp,filteredSubCols]);
 
+  // Défilement initial sur aujourd'hui, et conservation de la position
+  // quand on affiche / masque l'historique
+  const scrolledRef=useRef(false);
+  const today=fd(new Date());
+  useLayoutEffect(()=>{
+    if(loading||!gridRef.current) return;
+    if(!scrolledRef.current){
+      const idx=filteredDates.indexOf(today);
+      if(idx>=0){gridRef.current.scrollLeft=Math.max(0,LW+(idx*2-5)*hdw-80);scrolledRef.current=true;}
+      return;
+    }
+    if(scrollAnchorRef.current){
+      const {date,offset}=scrollAnchorRef.current; scrollAnchorRef.current=null;
+      const idx=filteredDates.indexOf(date);
+      if(idx>=0) gridRef.current.scrollLeft=idx*2*hdw+offset;
+    }
+  },[loading,filteredDates]);
+
+  function toggleHistory(){
+    if(gridRef.current){
+      const sl=gridRef.current.scrollLeft;
+      const idx=Math.max(0,Math.floor(sl/(2*hdw)));
+      const d=filteredDates[Math.min(idx,filteredDates.length-1)];
+      if(d) scrollAnchorRef.current={date:d,offset:sl-idx*2*hdw};
+    }
+    setShowHistory(v=>!v);
+  }
+
+  // ─── GLISSER-DÉPOSER (aucun rendu React pendant le glisser) ───────────────
+  function clearDragOver(){
+    if(dragOverElRef.current){dragOverElRef.current.classList.remove('dov');dragOverElRef.current=null;}
+  }
+  function onBandDragStart(e,row){
+    dragSrcRef.current=row;
+    e.dataTransfer.effectAllowed='move';
+    try{e.dataTransfer.setData('text/plain','of');}catch(_){}
+    const el=e.currentTarget; dragElRef.current=el;
+    requestAnimationFrame(()=>{el.style.opacity='.4';});
+  }
+  function onBandDragEnd(){
+    if(dragElRef.current){dragElRef.current.style.opacity='';dragElRef.current=null;}
+    clearDragOver();
+    dragSrcRef.current=null;
+  }
+  function onGridDragOver(e){
+    if(!dragSrcRef.current) return;
+    const el=e.target&&e.target.closest?e.target.closest('[data-m]'):null;
+    if(!el) return;
+    e.preventDefault();
+    if(dragOverElRef.current!==el){clearDragOver();el.classList.add('dov');dragOverElRef.current=el;}
+  }
   function subColFromEvent(e){
-    // Compute which subCol index the mouse is over based on X position
     if(!gridRef.current) return null;
     const rect=gridRef.current.getBoundingClientRect();
-    const scrollX=gridRef.current.scrollLeft;
-    const x=e.clientX-rect.left+scrollX-LW;
+    const x=e.clientX-rect.left+gridRef.current.scrollLeft-LW;
     if(x<0) return null;
     const idx=Math.floor(x/hdw);
-    if(idx>=0&&idx<filteredSubCols.length) return {idx, ...filteredSubCols[idx]}; // grille affichée (corrige le drop avec recherche active)
+    if(idx>=0&&idx<filteredSubCols.length) return filteredSubCols[idx];
     return null;
   }
-
-  async function onDrop(e,tMachine,tDate,tHD,tSlot){
-    e.preventDefault();setDragOver(null);
-    if(!dragSrc)return;
-    busyRef.current=true;
-    const src=dragSrc; setDragSrc(null);
-    let didChange=false;
-    try{
-      // Position réelle de la souris (grille affichée)
-      const actualCol=subColFromEvent(e);
-      if(actualCol){tDate=actualCol.date;tHD=actualCol.hd;}
-
-      // Identification de l'OF : par of_id si renseigné, sinon n°OF+client+désignation
-      const isSameOf = src.of_id
-        ? (r=>r.of_id===src.of_id)
-        : (r=>r.of_number===src.of_number&&r.client===src.client&&r.designation===src.designation);
-      const ofR=rows.filter(r=>r.machine===src.machine&&r.slot===src.slot&&isSameOf(r))
-        .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-      if(ofR.length===0) return;
-      const dur=ofR.length;
-
-      // Dépôt à l'identique -> rien à faire
-      if(tMachine===src.machine&&tSlot===src.slot&&tDate===src.date&&tHD===(src.half_day||1)) return;
-
-      // ── Grille de la machine CIBLE (exclut jours fermés / samedis non ouverts) ──
-      const msc=getMachineSubCols(tMachine);
-      const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
-      const mscG=msc.map(c=>subColsMap.get(c.date+'|'+c.hd));
-      // Index msc du créneau (date,hd), ou du premier créneau ouvert suivant
-      const mscAtOrAfter=(date,hd)=>{
-        const direct=mscMap.get(date+'|'+hd);
-        if(direct!==undefined) return direct;
-        const g=subColsMap.get(date+'|'+hd);
-        if(g===undefined) return -1;
-        for(let k=0;k<mscG.length;k++) if(mscG[k]>=g) return k;
-        return -1;
-      };
-
-      let mTgtIdx=mscAtOrAfter(tDate,tHD);
-      if(mTgtIdx<0){showToast('Dépôt impossible : aucun créneau ouvert pour '+tMachine+' à cette date');return;}
-      // Recale sur le créneau réellement ouvert (si on a visé un jour fermé)
-      tDate=msc[mTgtIdx].date; tHD=msc[mTgtIdx].hd;
-
-      // Si changement de machine : recalcule la durée en équipes sur la grille cible
-      let newDur=dur;
-      if(tMachine!==src.machine){
-        const totalEq=ofR.reduce((sum,r)=>{
-          const m=getRegime(regimes,src.machine,r.date);
-          return sum+(m==='2x8'?1:0.5);
-        },0);
-        let eq=0; newDur=0;
-        for(let k=mTgtIdx;k<msc.length&&eq<totalEq;k++){
-          const m=getRegime(regimes,tMachine,msc[k].date);
-          eq+=(m==='2x8'?1:0.5);
-          newDur++;
-        }
-      }
-
-      // ── Nouvelles positions de l'OF déplacé — TOUJOURS dans la grille machine ──
-      const dragMoves=[];
-      if(tMachine===src.machine){
-        const mSrcIdx=mscAtOrAfter(src.date,src.half_day||1);
-        if(mSrcIdx<0) return;
-        const mDiff=mTgtIdx-mSrcIdx;
-        const usedNi=new Set();
-        for(const r of ofR){
-          const ri=mscAtOrAfter(r.date,r.half_day||1);
-          if(ri<0) continue;
-          let ni=ri+mDiff;
-          while(usedNi.has(ni)) ni++;
-          if(ni>=0&&ni<msc.length){usedNi.add(ni);dragMoves.push({r,nc:msc[ni],isNew:false});}
-        }
-      } else {
-        for(let k=0;k<newDur;k++){
-          const ni=mTgtIdx+k;
-          if(ni<msc.length) dragMoves.push({r:ofR[k]||ofR[ofR.length-1],nc:msc[ni],isNew:k>=dur});
-        }
-      }
-      if(dragMoves.length===0) return;
-
-      // ── Conflits : tout est calculé en indices machine (msc) ──
-      const newOccupied=new Set(dragMoves.map(m=>mscMap.get(m.nc.date+'|'+m.nc.hd)));
-      const newArr=[...newOccupied].sort((a,b)=>a-b);
-      const newMin=newArr[0], newMax=newArr[newArr.length-1];
-
-      const sameMachine=tMachine===src.machine;
-      const srcIndices=sameMachine?new Set(ofR.map(r=>mscAtOrAfter(r.date,r.half_day||1))):new Set();
-
-      // Occupation d'origine de la ligne cible (OF déplacé inclus) — sert à
-      // détecter les OF "isolés" (= calés à une date de réception matière)
-      const occupiedOrig=new Set();
-      rows.forEach(r=>{
-        if(r.machine!==tMachine||r.slot!==tSlot)return;
-        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
-        if(mi!==undefined)occupiedOrig.add(mi);
-      });
-
-      // Groupes d'OF présents sur la ligne cible (hors OF déplacé)
-      const ofMap={};
-      rows.forEach(r=>{
-        if(r.machine!==tMachine||r.slot!==tSlot) return;
-        if(isSameOf(r)&&r.machine===src.machine&&r.slot===src.slot) return;
-        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
-        if(mi===undefined) return;
-        if(sameMachine&&src.slot===tSlot&&srcIndices.has(mi)) return; // créneaux libérés
-        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
-        if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
-        ofMap[k].rows.push({r,mi});
-        if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
-        if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
-      });
-      const sortedGroups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
-
-      // ── Cascade : pousse chaque groupe en collision du minimum nécessaire.
-      //    La chaîne continue tant qu'un groupe repoussé en percute un autre.
-      const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
-      let nextFree=newMax+1;
-      for(const grp of sortedGroups){
-        if(grp.maxIdx<newMin) continue;      // entièrement avant la zone d'arrivée
-        if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
-        const offset=nextFree-grp.minIdx;
-        // OF isolé = pas de créneau occupé juste devant lui -> calé sur une date
-        if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp);
-        pushedGroups.push(grp);
-        for(const {r,mi} of grp.rows){
-          const ni=mi+offset;
-          if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
-        }
-        nextFree=grp.maxIdx+offset+1;
-      }
-
-      // ── VALIDATION : des OF calés sur une réception matière vont être repoussés ──
-      if(anchoredPushed.length>0){
-        const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
-        const okGo=window.confirm(
-          '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
-          'Ce déplacement va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
-          noms+'\n\n'+
-          'Ces OF sont normalement calés sur une date de réception de matière.\n\n'+
-          'OK = repousser quand même\nAnnuler = ne rien déplacer'
-        );
-        if(!okGo){showToast('Déplacement annulé — OF calé sur réception matière');return;}
-      }
-
-      // ── EXÉCUTION ATOMIQUE ──
-      const actualDeleted=[];
-      const actualInserted=[];
-      didChange=true;
-      try{
-        const dragSrcRows=dragMoves.filter(m=>!m.isNew).map(m=>m.r);
-        const allSrcToDelete=ofR.filter(r=>!dragMoves.find(m=>!m.isNew&&m.r.id===r.id));
-        const allToDelete=[...dragSrcRows,...shiftMoves.map(m=>m.r),...allSrcToDelete];
-        actualDeleted.push(...allToDelete);
-
-        // BULK DELETE
-        if(allToDelete.length>0){
-          const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
-          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-        }
-
-        // BULK INSERT : OF repoussés
-        if(shiftMoves.length>0){
-          const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
-          const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
-          if(res) actualInserted.push(...res);
-        }
-
-        // BULK INSERT : OF déplacé
-        const lastSrc=ofR[ofR.length-1];
-        const dragPayload=dragMoves.map(({r,nc,isNew})=>{
-          const base=isNew?lastSrc:r;
-          const {id,...rest}=base;
-          return {...rest,machine:tMachine,date:nc.date,half_day:nc.hd,slot:tSlot};
-        });
-        if(dragPayload.length>0){
-          const res=await sb('planning',{method:'POST',body:JSON.stringify(dragPayload),prefer:'return=representation'});
-          if(res) actualInserted.push(...res);
-        }
-
-        pushHistory('Déplacement '+src.client, {deleted:actualDeleted, inserted:actualInserted});
-        const nPushed=pushedGroups.length;
-        if(nPushed>0) showToast('\u2713 OF déplacé · '+nPushed+' repoussé(s) · Ctrl+Z');
-        else showToast('\u2713 OF déplacé · Ctrl+Z pour annuler');
-      }catch(err){
-        console.error('onDrop error:', err);
-        showToast('Erreur: '+err.message.slice(0,120));
-        // Rollback
-        try{
-          if(actualInserted.length>0){
-            const ids=actualInserted.map(r=>r.id).join(',');
-            await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-          }
-          if(actualDeleted.length>0){
-            const payload=actualDeleted.map(({id,...rest})=>rest);
-            await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-          }
-          showToast('État restauré');
-        }catch(e2){showToast('Restauration partielle — Ctrl+Z');}
-      }
-    }finally{
-      busyRef.current=false;          // le verrou est TOUJOURS relâché (corrige l'auto-sync gelé)
-      if(didChange) loadPlanning();
-    }
+  async function onGridDrop(e){
+    const el=e.target&&e.target.closest?e.target.closest('[data-m]'):null;
+    const src=dragSrcRef.current;
+    clearDragOver();
+    if(!el||!src) return;
+    e.preventDefault();
+    dragSrcRef.current=null;
+    if(isLocked) return;
+    const col=subColFromEvent(e);
+    if(!col) return;
+    const tMachine=el.getAttribute('data-m');
+    const res=planDrop({rows:rowsRef.current,src,tMachine,tSlot:1,tDate:col.date,tHD:col.hd,cols:machineColsFor(tMachine),regimes:regRef.current});
+    if(res.noop) return;
+    if(res.error){showToast(res.error);return;}
+    if(res.blocked){showToast(blockedMessage(res.blocked));return;}
+    if(res.anchored.length&&!window.confirm(anchoredMessage(res.anchored,'Ce déplacement'))){showToast('Déplacement annulé — OF calé sur réception matière');return;}
+    const n=res.pushed.length;
+    await commit({label:'Déplacement '+(src.client||src.of_number||''),remove:res.remove,add:res.add,
+      toastMsg:'✓ OF déplacé'+(n?' · '+n+' repoussé(s)':'')+' · Ctrl+Z pour annuler'});
   }
 
+  // ─── AJOUT / MODIFICATION / SUPPRESSION ──────────────────────────────────
   async function onSave(formData, halfDayCount, origData, newDurOverride){
-    busyRef.current=true;
-    try{
-      if(modal.type==='add'){
-        const startHD=formData.half_day||1;
-        const openSatsForMachine=new Set(Object.entries(satConfigs)
-          .filter(([d,ms])=>ms.includes(formData.machine))
-          .map(([d])=>d));
-        const closedDaysForMachine=new Set(Object.entries(closures)
-          .filter(([k])=>k.startsWith(formData.machine+'|'))
-          .map(([k])=>k.split('|')[1]));
-        const slots=planHalfDays(halfDayCount, formData.date, startHD, sets, formData.machine, sat, null, openSatsForMachine, closedDaysForMachine);
-
-        // ── Cascade — mêmes règles que déplacement/étirement/régime/samedi ──
-        const msc=getMachineSubCols(formData.machine);
-        const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
-        const newArr=[...new Set(slots.map(sl=>mscMap.get(sl.date+'|'+sl.half_day)).filter(x=>x!==undefined))].sort((a,b)=>a-b);
-        const newMin=newArr.length?newArr[0]:-1, newMax=newArr.length?newArr[newArr.length-1]:-2;
-
-        // Occupation d'origine (détection OF isolés) + groupes d'OF de la ligne
-        const occupiedOrig=new Set();
-        const ofMapA={};
-        rows.forEach(r=>{
-          if(r.machine!==formData.machine||r.slot!==formData.slot) return;
-          const mi=mscMap.get(r.date+'|'+(r.half_day||1));
-          if(mi===undefined) return;
-          occupiedOrig.add(mi);
-          const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
-          if(!ofMapA[k]) ofMapA[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
-          ofMapA[k].rows.push({r,mi});
-          if(mi<ofMapA[k].minIdx){ofMapA[k].minIdx=mi;ofMapA[k].date0=r.date;}
-          if(mi>ofMapA[k].maxIdx)ofMapA[k].maxIdx=mi;
-        });
-        const groupsA=Object.values(ofMapA).sort((a,b)=>a.minIdx-b.minIdx);
-
-        const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
-        let nextFree=newMax+1;
-        for(const grp of groupsA){
-          if(grp.maxIdx<newMin) continue;      // entièrement avant le nouvel OF
-          if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
-          const offset=nextFree-grp.minIdx;
-          if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp); // OF isolé
-          pushedGroups.push(grp);
-          for(const {r,mi} of grp.rows){
-            const ni=mi+offset;
-            if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
-          }
-          nextFree=grp.maxIdx+offset+1;
-        }
-
-        // ── VALIDATION réception matière (avant toute écriture) ──
-        if(anchoredPushed.length>0){
-          const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
-          const okGo=window.confirm(
-            '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
-            'L\u2019ajout de cet OF va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
-            noms+'\n\n'+
-            'OK = repousser quand même\nAnnuler = ne pas ajouter'
-          );
-          if(!okGo){showToast('Ajout annulé — OF calé sur réception matière');return;}
-        }
-
-        // CASCADE : bulk delete + bulk insert (IDs capturés pour Ctrl+Z)
-        const toDeleteRows=pushedGroups.flatMap(g=>g.rows.map(x=>x.r));
-        let cascadeInserted=[];
-        if(toDeleteRows.length>0){
-          const ids=[...new Set(toDeleteRows.map(r=>r.id))].join(',');
-          await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-        }
-        if(shiftMoves.length>0){
-          const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
-          const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
-          cascadeInserted=res||[];
-        }
-
-        const payload=slots.map(s=>({...formData,date:s.date,half_day:s.half_day}));
-        const inserted=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
-        // Undo complet : supprime nouvel OF + cascadés insérés, restaure cascadés originaux
-        pushHistory('Ajout '+formData.client, {
-          deleted: toDeleteRows,
-          inserted: [...(inserted||[]), ...cascadeInserted]
-        });
-        if(formData.client) await sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
-        showToast('✓ OF ajouté — '+slots.length+' demi-journée(s) · Ctrl+Z pour annuler');
-      } else {
-        const patch={
-          of_number: formData.of_number,
-          client: formData.client,
-          designation: formData.designation,
-          mac: formData.mac,
-          qte: formData.qte,
-          depart: formData.depart,
-          conducteur: formData.conducteur,
-          bold: formData.bold,
-          format: formData.format||'',
-        };
-        const orig=origData||formData;
-        const allOfRows=rows.filter(r=>
-          r.machine===orig.machine && r.slot===orig.slot &&
-          r.of_number===orig.of_number && r.client===orig.client && r.designation===orig.designation
-        );
-        if(allOfRows.length>0){
-          const ids=allOfRows.map(r=>r.id).join(',');
-          await sb('planning?id=in.('+ids+')',{method:'PATCH',body:JSON.stringify(patch),prefer:'return=minimal'});
-        }
-        const patchedRows=allOfRows.map(r=>({...r,...patch}));
-        // Pour undo : supprimer les rows patchées (inserted=patchedRows) et réinsérer les anciennes (deleted=allOfRows)
-        pushHistory('Modif '+orig.client+'→'+formData.client, {deleted:allOfRows, inserted:patchedRows});
-        showToast('✓ Mis à jour ('+allOfRows.length+' demi-j) · Ctrl+Z pour annuler');
-
-        // Resize intégré : on utilise allOfRows déjà connu (avant reload)
-        if(newDurOverride!==undefined && newDurOverride!==allOfRows.length){
-          await onResize(orig.machine, formData.of_number, formData.client, formData.designation, orig.slot, newDurOverride, patchedRows);
-          busyRef.current=false;
-          return;
-        }
+    if(modal.type==='add'){
+      const sc=satRef.current, cl=closRef.current;
+      const openSats=new Set(Object.entries(sc).filter(([d,ms])=>ms.includes(formData.machine)).map(([d])=>d));
+      const closedDays=new Set(Object.keys(cl).filter(k=>k.startsWith(formData.machine+'|')).map(k=>k.split('|')[1]));
+      const slots=planHalfDays(halfDayCount, formData.date, formData.half_day||1, sets, formData.machine, sat, null, openSats, closedDays);
+      const newRows=slots.map(s=>({...stripId(formData),date:s.date,half_day:s.half_day}));
+      const res=planAdd({rows:rowsRef.current,newRows,machine:formData.machine,slot:formData.slot,cols:machineColsFor(formData.machine)});
+      if(res.blocked){showToast(blockedMessage(res.blocked));return;}
+      if(res.anchored.length&&!window.confirm(anchoredMessage(res.anchored,'L’ajout de cet OF'))){showToast('Ajout annulé — OF calé sur réception matière');return;}
+      setModal(null);
+      const ok=await commit({label:'Ajout '+formData.client,remove:res.remove,add:res.add,
+        toastMsg:'✓ OF ajouté — '+slots.length+' demi-journée(s) · Ctrl+Z pour annuler'});
+      if(ok&&formData.client&&!clients.includes(formData.client)){
+        sb('clients',{method:'POST',body:JSON.stringify({nom:formData.client}),prefer:'return=minimal'}).catch(()=>{});
+        setClients(c=>[...c,formData.client].sort());
       }
-      setModal(null);loadPlanning();
-    }catch(e){showToast('Erreur: '+e.message);}
-    finally{busyRef.current=false;}
+      return;
+    }
+    // Modification (+ changement de durée éventuel) = une seule action d'historique
+    const orig=origData||formData;
+    const patch={of_number:formData.of_number,client:formData.client,designation:formData.designation,
+      mac:formData.mac,qte:formData.qte,depart:formData.depart,conducteur:formData.conducteur,
+      bold:formData.bold,format:formData.format||''};
+    const isSame=sameOfPred(orig);
+    const allOfRows=rowsRef.current.filter(r=>r.machine===orig.machine&&r.slot===orig.slot&&isSame(r));
+    if(!allOfRows.length){setModal(null);return;}
+    const patched=allOfRows.map(r=>({...r,...patch,id:'p_'+r.id}));
+    let diff={remove:allOfRows,add:patched.map(stripId)};
+    let extraMsg='';
+    if(newDurOverride!==undefined&&newDurOverride!==allOfRows.length){
+      const pseudo=rowsRef.current.filter(r=>!allOfRows.includes(r)).concat(patched);
+      const res=planResize({rows:pseudo,first:patched[0],newLen:newDurOverride,cols:machineColsFor(orig.machine)});
+      if(res.error){showToast(res.error);return;}
+      if(res.blocked){showToast(blockedMessage(res.blocked));return;}
+      if(!res.noop){
+        if(res.anchored.length&&!window.confirm(anchoredMessage(res.anchored,'Cette extension'))){showToast('Modification annulée — OF calé sur réception matière');return;}
+        diff=composeDiff({remove:allOfRows,add:patched},res);
+        if(res.pushed&&res.pushed.length) extraMsg=' · '+res.pushed.length+' OF repoussé(s)';
+      }
+    }
+    setModal(null);
+    await commit({label:'Modification '+(formData.client||orig.client),remove:diff.remove,add:diff.add,
+      toastMsg:'✓ OF mis à jour'+extraMsg+' · Ctrl+Z pour annuler'});
   }
 
   async function onDel(id){
-    busyRef.current=true;
-    try{
-      const clicked=rows.find(x=>x.id===id);
-      if(!clicked) return;
-      const toDelRows=rows.filter(r=>
-        r.machine===clicked.machine && r.slot===clicked.slot &&
-        r.of_number===clicked.of_number && r.client===clicked.client && r.designation===clicked.designation
-      );
-      const ids=toDelRows.map(r=>r.id).join(',');
-      await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-      pushHistory('Suppression '+clicked.client, {deleted:toDelRows, inserted:[]});
-      showToast('✓ Supprimé · Ctrl+Z pour annuler');setModal(null);loadPlanning();
-    }
-    catch(e){showToast('Erreur: '+e.message);}
-    finally{busyRef.current=false;}
+    const clicked=rowsRef.current.find(x=>x.id===id);
+    if(!clicked) return;
+    const isSame=sameOfPred(clicked);
+    const toDel=rowsRef.current.filter(r=>r.machine===clicked.machine&&r.slot===clicked.slot&&isSame(r));
+    setModal(null);
+    await commit({label:'Suppression '+clicked.client,remove:toDel,add:[],toastMsg:'✓ Supprimé · Ctrl+Z pour annuler'});
   }
 
   async function onShift(machine,of_number,client,designation,slot,halfDays){
-    const ofR=rows.filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
-      .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-    const moves=[];
-    for(const r of ofR){
-      const ri=subColsMap.get(r.date+'|'+(r.half_day||1));
-      const ni=ri+halfDays;
-      if(ri!==undefined&&ni>=0&&ni<subCols.length) moves.push({r, nc:subCols[ni]});
-    }
-    if(moves.length===0) return;
-    try{
-      busyRef.current=true;
-      const ids=moves.map(m=>m.r.id).join(',');
-      await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-      const payload=moves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
-      const res=await sb('planning',{method:'POST',body:JSON.stringify(payload),prefer:'return=representation'});
-      pushHistory('Décalage '+client, {deleted:ofR, inserted:res||[]});
-      showToast('✓ Décalé '+(halfDays>0?'+':'')+halfDays+' demi-j · Ctrl+Z pour annuler');
-      setModal(null);
-    }catch(e){showToast('Erreur: '+e.message);}
-    finally{busyRef.current=false;loadPlanning();}
+    const first=rowsRef.current.find(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation);
+    if(!first) return;
+    const isSame=sameOfPred(first);
+    const cols=machineColsFor(machine), map=colIndexMap(cols);
+    const ofR=rowsRef.current.filter(r=>r.machine===machine&&r.slot===slot&&isSame(r));
+    const add=[];
+    ofR.forEach(r=>{const ri=map.get(r.date+'|'+(r.half_day||1));const ni=ri+halfDays;if(ri!==undefined&&ni>=0&&ni<cols.length)add.push(moveRow(r,cols[ni]));});
+    if(!add.length) return;
+    setModal(null);
+    await commit({label:'Décalage '+client,remove:ofR,add,toastMsg:'✓ Décalé · Ctrl+Z pour annuler'});
   }
 
-  // ── DRAG-RESIZE handlers ──────────────────────────────────────
-  const resizeRef=useRef(null); // tracks live resize state without stale closure
-
-  // Compute drop target (date, hd) from mouse X position on the grid
-  function dropTargetFromX(clientX){
-    if(!gridRef.current) return null;
-    const rect=gridRef.current.getBoundingClientRect();
-    const scrollX=gridRef.current.scrollLeft;
-    const x=clientX - rect.left + scrollX - LW;
-    if(x<0) return null;
-    const idx=Math.floor(x/hdw);
-    if(idx>=0 && idx<filteredSubCols.length) return filteredSubCols[idx];
-    return null;
+  async function onResize(first,newLen){
+    const res=planResize({rows:rowsRef.current,first,newLen,cols:machineColsFor(first.machine)});
+    if(res.noop) return;
+    if(res.error){showToast(res.error);return;}
+    if(res.blocked){showToast(blockedMessage(res.blocked));return;}
+    if(res.anchored.length&&!window.confirm(anchoredMessage(res.anchored,'Cette extension'))){showToast('Extension annulée — OF calé sur réception matière');return;}
+    await commit({label:'Durée '+(first.of_number||first.client),remove:res.remove,add:res.add,
+      toastMsg:(res.reduced?'✓ OF réduit':'✓ OF étendu'+(res.pushed.length?' · '+res.pushed.length+' OF repoussé(s)':''))+' · Ctrl+Z pour annuler'});
   }
 
   function onResizeStart(e, band, slot, machine){
     e.stopPropagation(); e.preventDefault();
-    const lastRow=band.rows[band.rows.length-1];
     const state={band, slot, machine, startX:e.clientX, origDur:band.rows.length, curDur:band.rows.length};
-    resizeRef.current=state;
-    setResizeSrc({...state});
-
+    let cur=state;
+    setResizeSrc(state);
     function onMove(ev){
-      const dx=ev.clientX-state.startX;
-      const deltaCols=Math.round(dx/hdw);
-      const newDur=Math.max(1, state.origDur+deltaCols);
-      resizeRef.current={...resizeRef.current, curDur:newDur};
-      setResizeSrc(r=>r?{...r,curDur:newDur}:null);
+      const newDur=Math.max(1, state.origDur+Math.round((ev.clientX-state.startX)/hdw));
+      if(newDur===cur.curDur) return; // ne redessine que si la durée change
+      cur={...cur,curDur:newDur};
+      setResizeSrc(cur);
     }
-    async function onUp(){
+    function onUp(){
       window.removeEventListener('mousemove',onMove);
       window.removeEventListener('mouseup',onUp);
-      const rs=resizeRef.current;
-      resizeRef.current=null;
       setResizeSrc(null);
       justResizedRef.current=true;
       setTimeout(()=>{justResizedRef.current=false;},300);
-      if(rs && rs.curDur!==rs.origDur){
-        busyRef.current=true;
-        try{
-          await onResize(rs.machine, rs.band.of_number, rs.band.client, rs.band.designation, rs.slot, rs.curDur);
-        }finally{busyRef.current=false;}
-      }
+      if(cur.curDur!==cur.origDur) onResize(band.fr,cur.curDur);
     }
     window.addEventListener('mousemove',onMove);
     window.addEventListener('mouseup',onUp);
   }
 
-  // Resize OF: change duration, pushing ALL subsequent OFs if growing
-  async function onResize(machine,of_number,client,designation,slot,newHalfDays,knownRows){
-    const ofR=(knownRows||rows).filter(r=>r.machine===machine&&r.slot===slot&&r.of_number===of_number&&r.client===client&&r.designation===designation)
-      .sort((a,b)=>pd(a.date)-pd(b.date)||(a.half_day||1)-(b.half_day||1));
-    const curLen=ofR.length;
-    if(newHalfDays===curLen||curLen===0){setModal(null);return;}
-    const last=ofR[ofR.length-1];
-    const extra=newHalfDays-curLen; // positif = étendre, négatif = réduire
-
-    try{
-      if(extra<0){
-        // Réduction : suppression des derniers créneaux (ne pousse personne)
-        const toRemove=ofR.slice(newHalfDays);
-        const ids=toRemove.map(r=>r.id).join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-        pushHistory('Réduit '+of_number, {deleted:toRemove, inserted:[]});
-        showToast('\u2713 Réduit à '+newHalfDays/2+' éq · Ctrl+Z pour annuler');
-        setModal(null);loadPlanning();
-        return;
-      }
-
-      // ── Extension — tout en grille machine (jours fermés / samedis exclus) ──
-      const msc=getMachineSubCols(machine);
-      const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
-      const lastIdxMsc=mscMap.get(last.date+'|'+(last.half_day||1));
-      if(lastIdxMsc===undefined){showToast('Erreur resize: position introuvable');setModal(null);return;}
-      const addSlots=[];
-      for(let k=1;k<=extra;k++){
-        const ni=lastIdxMsc+k;
-        if(ni<msc.length) addSlots.push(msc[ni]);
-      }
-
-      // Occupation d'origine (pour détecter les OF isolés) + groupes d'OF
-      const occupiedOrig=new Set();
-      const ofMapR={};
-      rows.forEach(r=>{
-        if(r.machine!==machine||r.slot!==slot) return;
-        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
-        if(mi===undefined) return;
-        occupiedOrig.add(mi);
-        if(r.of_number===of_number&&r.client===client&&r.designation===designation) return;
-        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
-        if(!ofMapR[k]) ofMapR[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
-        ofMapR[k].rows.push({r,mi});
-        if(mi<ofMapR[k].minIdx){ofMapR[k].minIdx=mi;ofMapR[k].date0=r.date;}
-        if(mi>ofMapR[k].maxIdx)ofMapR[k].maxIdx=mi;
-      });
-      const groups=Object.values(ofMapR).sort((a,b)=>a.minIdx-b.minIdx);
-
-      // ── Cascade minimale : mêmes règles que le déplacement ──
-      const newMin=lastIdxMsc+1, newMax=lastIdxMsc+extra;
-      const shiftMoves=[]; const pushedGroups=[]; const anchoredPushed=[];
-      let nextFree=newMax+1;
-      for(const grp of groups){
-        if(grp.maxIdx<newMin) continue;      // entièrement avant la zone étendue
-        if(grp.minIdx>=nextFree) break;      // plus de collision : fin de cascade
-        const offset=nextFree-grp.minIdx;
-        if(!occupiedOrig.has(grp.minIdx-1)) anchoredPushed.push(grp); // OF isolé
-        pushedGroups.push(grp);
-        for(const {r,mi} of grp.rows){
-          const ni=mi+offset;
-          if(ni>=0&&ni<msc.length) shiftMoves.push({r,nc:msc[ni]});
-        }
-        nextFree=grp.maxIdx+offset+1;
-      }
-
-      // ── VALIDATION réception matière (avant toute écriture) ──
-      if(anchoredPushed.length>0){
-        const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
-        const okGo=window.confirm(
-          '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
-          'Cette extension va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
-          noms+'\n\n'+
-          'OK = repousser quand même\nAnnuler = ne pas étendre'
-        );
-        if(!okGo){showToast('Extension annulée — OF calé sur réception matière');setModal(null);return;}
-      }
-
-      // ── EXÉCUTION ATOMIQUE ──
-      const actualInserted=[];
-      const toDeleteRows=pushedGroups.flatMap(g=>g.rows.map(x=>x.r));
-      if(toDeleteRows.length>0){
-        const ids=[...new Set(toDeleteRows.map(r=>r.id))].join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-      }
-      if(shiftMoves.length>0){
-        const shiftPayload=shiftMoves.map(({r,nc})=>{const {id,...rest}=r;return {...rest,date:nc.date,half_day:nc.hd};});
-        const res=await sb('planning',{method:'POST',body:JSON.stringify(shiftPayload),prefer:'return=representation'});
-        if(res) actualInserted.push(...res);
-      }
-      if(addSlots.length>0){
-        const addPayload=addSlots.map(nc=>({machine,date:nc.date,half_day:nc.hd,slot,
-          of_number,client,designation,mac:last.mac,qte:last.qte,
-          format:last.format||'',depart:last.depart,conducteur:last.conducteur,bold:last.bold,
-          ...(last.of_id?{of_id:last.of_id}:{})}));
-        const res=await sb('planning',{method:'POST',body:JSON.stringify(addPayload),prefer:'return=representation'});
-        if(res) actualInserted.push(...res);
-      }
-
-      pushHistory('Redimensionnement '+of_number, {deleted:toDeleteRows, inserted:actualInserted});
-      showToast('\u2713 Étendu à '+newHalfDays/2+' éq'+(pushedGroups.length?' · '+pushedGroups.length+' OF repoussé(s)':'') +' · Ctrl+Z pour annuler');
-      setModal(null);loadPlanning();
-    }catch(e){showToast('Erreur resize: '+e.message);}
-  }
-
-  // Saturday config
+  // ─── SAMEDIS / FERMETURES / RÉGIMES / OPÉRATEURS ─────────────────────────
   async function saveSatConfig(date, machines){
-    const prevMachines=satConfigs[date]||[];
-    const newlyAdded=machines.filter(m=>!prevMachines.includes(m));
-    const newlyRemoved=prevMachines.filter(m=>!machines.includes(m));
-
-    // ── 1. TOUT est calculé AVANT d'écrire quoi que ce soit en base ──
-    // Grille d'une machine avec/sans LE samedi basculé (autres samedis et
-    // jours fermés de la machine respectés)
-    const machineCols=(machine,satOpen)=>{
-      const allDates=new Set(dates);
-      if(satOpen) allDates.add(date); else allDates.delete(date);
-      const sorted=[...allDates].sort((a,b)=>pd(a)-pd(b));
-      const cols=[];
-      sorted.forEach(d=>{
-        if(d!==date){
-          const dow=pd(d).getDay();
-          if(dow===6&&!((satConfigs[d]||[]).includes(machine))) return;
-        }
-        if(closures[machine+'|'+d]) return;
-        cols.push({date:d,hd:1});cols.push({date:d,hd:2});
-      });
-      return cols;
-    };
-
-    const allToDelete=[]; const allToInsert=[]; const anchoredPushed=[];
-
-    for(const machine of [...newlyAdded,...newlyRemoved]){
-      const opened=newlyAdded.includes(machine);
-      const oldMsc=machineCols(machine,!opened);
-      const newMsc=machineCols(machine,opened);
-      const oldMap=new Map(); oldMsc.forEach((c,k)=>oldMap.set(c.date+'|'+c.hd,k));
-      const newMap=new Map(); newMsc.forEach((c,k)=>newMap.set(c.date+'|'+c.hd,k));
-      // Premier créneau de la nouvelle grille à partir de (date,hd)
-      const newIdxAtOrAfter=(d,hd)=>{
-        const direct=newMap.get(d+'|'+hd);
-        if(direct!==undefined) return direct;
-        const g=pd(d).getTime();
-        for(let k=0;k<newMsc.length;k++){
-          const gt=pd(newMsc[k].date).getTime();
-          if(gt>g||(gt===g&&newMsc[k].hd>=hd)) return k;
-        }
-        return -1;
-      };
-
-      const machRows=rows.filter(r=>r.machine===machine);
-      const slots=[...new Set(machRows.map(r=>r.slot))];
-      for(const slot of slots){
-        const ofMap={};
-        machRows.forEach(r=>{
-          if(r.slot!==slot) return;
-          const mi=oldMap.get(r.date+'|'+(r.half_day||1));
-          if(mi===undefined) return;
-          const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
-          if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
-          ofMap[k].rows.push({r,mi});
-          if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
-          if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
-        });
-        const groups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
-
-        let prevOrigEnd=-2, prevNewEnd=-1;
-        for(const grp of groups){
-          grp.rows.sort((a,b)=>a.mi-b.mi);
-          const glued=grp.minIdx===prevOrigEnd+1;
-          const first=grp.rows[0].r;
-          // OF collé -> suit le mouvement ; OF isolé -> garde sa date de départ
-          let ns=glued?prevNewEnd+1:newIdxAtOrAfter(first.date,first.half_day||1);
-          if(ns<0) ns=prevNewEnd+1;
-          if(!glued&&ns<=prevNewEnd){ ns=prevNewEnd+1; anchoredPushed.push(grp); }
-          const nd=grp.rows.length; // durée en demi-journées inchangée
-          prevOrigEnd=grp.maxIdx; prevNewEnd=ns+nd-1;
-          // Aucun changement de cellules -> aucune écriture
-          const same=grp.rows.every(({r},idx)=>{
-            const ni=ns+idx;
-            return ni<newMsc.length&&newMsc[ni].date===r.date&&newMsc[ni].hd===(r.half_day||1);
-          });
-          if(same) continue;
-          grp.rows.forEach(({r})=>allToDelete.push(r));
-          grp.rows.forEach(({r},idx)=>{
-            const ni=ns+idx;
-            if(ni<0||ni>=newMsc.length) return;
-            const {id,...rest}=r;
-            allToInsert.push({...rest,date:newMsc[ni].date,half_day:newMsc[ni].hd});
-          });
-        }
-      }
-    }
-
-    // ── 2. VALIDATION réception matière (avant toute écriture) ──
-    if(anchoredPushed.length>0){
-      const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
-      const okGo=window.confirm(
-        '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
-        'Cette modification du samedi '+date+' va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
-        noms+'\n\n'+
-        'OK = repousser quand même\nAnnuler = ne rien modifier'
-      );
-      if(!okGo){ showToast('Modification du samedi annulée'); return; }
-    }
-
+    const sc=satRef.current, cl=closRef.current;
+    const prev=sc[date]||[];
+    const changed=MACHINES.filter(m=>prev.includes(m)!==machines.includes(m));
+    const newSc={...sc,[date]:machines};
+    let remove=[],add=[],anchored=[];
+    changed.forEach(m=>{
+      const r=planResim(rowsRef.current,m,machineColsFor(m,sc,cl),machineColsFor(m,newSc,cl));
+      remove=remove.concat(r.remove);add=add.concat(r.add);anchored=anchored.concat(r.anchored);
+    });
+    if(anchored.length&&!window.confirm(anchoredMessage(anchored,'Cette modification du samedi '+date))){showToast('Modification du samedi annulée');return;}
     setSatModal(null);
-
-    // ── 3. ÉCRITURE ──
-    busyRef.current=true;
-    try{
-      await sb('saturday_config?date=eq.'+encodeURIComponent(date),{method:'DELETE',prefer:'return=minimal'}).catch(()=>{});
-      if(machines.length>0)
-        await sb('saturday_config',{method:'POST',body:JSON.stringify({date,machines}),prefer:'return=minimal'});
-
-      if(allToDelete.length>0){
-        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-      }
-      let insertedRes=[];
-      if(allToInsert.length>0){
-        insertedRes=await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=representation'})||[];
-      }
-      if(allToDelete.length>0||allToInsert.length>0){
-        pushHistory('Samedi '+date, {deleted:allToDelete, inserted:insertedRes});
-      }
-    }catch(e){showToast('Erreur samedi: '+e.message);}
-    finally{
-      busyRef.current=false;
-      setSatConfigs(s=>({...s,[date]:machines}));
-      load();
-    }
-  }
-  // Helper: get next saturday after a friday date
-  function nextSaturday(fridayStr){
-    var d=pd(fridayStr);d.setDate(d.getDate()+1);return fd(d);
+    await commit({label:'Samedi '+date,remove,add,aux:[{type:'sat',date,before:prev,after:machines}],
+      toastMsg:'✓ Samedi '+date+' mis à jour · Ctrl+Z pour annuler'});
   }
 
-  // Toggle regime for machine+date
+  async function setClosure(machine,date,closed){
+    const cl=closRef.current;
+    const newCl={...cl};
+    if(closed) newCl[machine+'|'+date]=true; else delete newCl[machine+'|'+date];
+    const r=planResim(rowsRef.current,machine,machineColsFor(machine,null,cl),machineColsFor(machine,null,newCl));
+    if(r.anchored.length&&!window.confirm(anchoredMessage(r.anchored,(closed?'La fermeture':'La réouverture')+' de '+machine+' le '+date))){showToast('Action annulée');return;}
+    await commit({label:(closed?'Fermeture ':'Réouverture ')+machine+' '+date,remove:r.remove,add:r.add,
+      aux:[{type:'closure',machine,date,before:!closed,after:closed}],
+      toastMsg:'✓ '+machine+(closed?' fermée':' rouverte')+' le '+date+' · Ctrl+Z pour annuler'});
+  }
+  const saveClosure=(machine,date)=>setClosure(machine,date,true);
+  const openClosure=(machine,date)=>setClosure(machine,date,false);
+
   async function toggleRegime(machine, date){
-    const cur=getRegime(regimes,machine,date);
+    const reg=regRef.current;
+    const cur=getRegime(reg,machine,date);
     const next=cur==='1x8'?'2x8':'1x8';
-
-    // ── 1. TOUT est calculé AVANT d'écrire quoi que ce soit en base ──
-    const newRegimes={...regimes,[machine+'|'+date]:next};
-    const eqNew=d=>((newRegimes[machine+'|'+d])||'1x8')==='2x8'?1:0.5;
-    const eqOld=d=>getRegime(regimes,machine,d)==='2x8'?1:0.5;
-
-    // Grille machine (jours fermés / samedis non ouverts exclus)
-    const msc=getMachineSubCols(machine);
-    const mscMap=new Map(); msc.forEach((c,k)=>mscMap.set(c.date+'|'+c.hd,k));
-
-    const machRows=rows.filter(r=>r.machine===machine);
-    const allToDelete=[]; const allToInsert=[]; const anchoredPushed=[];
-
-    // Re-simulation complète de chaque ligne (slot) de la machine :
-    // chaque OF est traité UNE seule fois. Il garde sa date de départ, sa durée
-    // est recalculée avec le nouveau régime (travail total en équipes inchangé).
-    // Les OF collés suivent ; un OF isolé (calé réception matière) ne bouge que
-    // s'il est percuté, et seulement après confirmation.
-    const slots=[...new Set(machRows.map(r=>r.slot))];
-    for(const slot of slots){
-      const ofMap={};
-      machRows.forEach(r=>{
-        if(r.slot!==slot) return;
-        const mi=mscMap.get(r.date+'|'+(r.half_day||1));
-        if(mi===undefined) return; // ligne posée sur un jour fermé : on n'y touche pas
-        const k=r.of_id?('#'+r.of_id):(r.of_number+'§'+r.client+'§'+r.designation);
-        if(!ofMap[k]) ofMap[k]={rows:[],minIdx:Infinity,maxIdx:-1,client:r.client,of_number:r.of_number,designation:r.designation,date0:r.date};
-        ofMap[k].rows.push({r,mi});
-        if(mi<ofMap[k].minIdx){ofMap[k].minIdx=mi;ofMap[k].date0=r.date;}
-        if(mi>ofMap[k].maxIdx)ofMap[k].maxIdx=mi;
-      });
-      const groups=Object.values(ofMap).sort((a,b)=>a.minIdx-b.minIdx);
-
-      let prevOrigEnd=-2, prevNewEnd=-1;
-      for(const grp of groups){
-        grp.rows.sort((a,b)=>a.mi-b.mi);
-        // Travail total en équipes, mesuré avec l'ANCIEN régime
-        const totalEq=grp.rows.reduce((sum,{r})=>sum+eqOld(r.date),0);
-        // Collé au groupe précédent -> il suit ; isolé -> il garde sa date
-        const glued=grp.minIdx===prevOrigEnd+1;
-        let ns=glued?prevNewEnd+1:grp.minIdx;
-        if(!glued&&ns<=prevNewEnd){ ns=prevNewEnd+1; anchoredPushed.push(grp); }
-        // Nouvelle durée avec le NOUVEAU régime, depuis la nouvelle position
-        let eq=0,nd=0;
-        for(let k=ns;k<msc.length&&eq<totalEq-1e-9;k++){ eq+=eqNew(msc[k].date); nd++; }
-        if(nd===0) nd=1;
-        prevOrigEnd=grp.maxIdx; prevNewEnd=ns+nd-1;
-        // Position et durée inchangées -> aucune écriture en base
-        const same= ns===grp.minIdx && nd===grp.rows.length &&
-          grp.rows.every(({mi},idx)=>mi===ns+idx);
-        if(same) continue;
-        grp.rows.forEach(({r})=>allToDelete.push(r));
-        for(let k=0;k<nd;k++){
-          const ni=ns+k;
-          if(ni>=msc.length) break;
-          const srcRow=grp.rows[Math.min(k,grp.rows.length-1)].r;
-          const {id,...rest}=srcRow;
-          allToInsert.push({...rest,date:msc[ni].date,half_day:msc[ni].hd});
-        }
-      }
-    }
-
-    // ── 2. VALIDATION réception matière (avant toute écriture) ──
-    if(anchoredPushed.length>0){
-      const noms=anchoredPushed.map(g=>'• '+(g.of_number?g.of_number+' — ':'')+g.client+(g.designation?' ('+g.designation+')':'')+' — calé au '+g.date0).join('\n');
-      const okGo=window.confirm(
-        '\u26a0 ATTENTION — RÉCEPTION MATIÈRE\n\n'+
-        'Le passage en '+(next==='2x8'?'2\u00d78':'1\u00d78')+' du '+date+' va repousser '+anchoredPushed.length+' OF positionné(s) à une date précise (sans OF collé derrière) :\n\n'+
-        noms+'\n\n'+
-        'OK = repousser quand même\nAnnuler = ne pas changer le régime'
-      );
-      if(!okGo){ showToast('Changement de régime annulé'); return; }
-    }
-
-    // ── 3. ÉCRITURE : régime + planning recalculé ──
-    setRegimes(r=>({...r,[machine+'|'+date]:next})); // UI optimiste
-    busyRef.current=true;
-    try{
-      try{
-        await sb('machine_regime?machine=eq.'+encodeURIComponent(machine)+'&date=eq.'+encodeURIComponent(date),
-          {method:'DELETE',prefer:'return=minimal'});
-      }catch(e){}
-      await sb('machine_regime',{method:'POST',body:JSON.stringify({machine,date,mode:next}),prefer:'return=minimal'});
-
-      if(allToDelete.length>0){
-        const ids=[...new Set(allToDelete.map(r=>r.id))].join(',');
-        await sb('planning?id=in.('+ids+')',{method:'DELETE',prefer:'return=minimal'});
-      }
-      let insertedRes=[];
-      if(allToInsert.length>0){
-        insertedRes=await sb('planning',{method:'POST',body:JSON.stringify(allToInsert),prefer:'return=representation'})||[];
-      }
-      if(allToDelete.length>0||allToInsert.length>0){
-        pushHistory('Régime '+next+' '+machine+' '+date, {deleted:allToDelete, inserted:insertedRes});
-      }
-    }catch(e){
-      showToast('Erreur régime: '+e.message.slice(0,120));
-    }finally{busyRef.current=false;}
-    loadPlanning();
+    const regNew={...reg,[machine+'|'+date]:next};
+    const r=planRegime(rowsRef.current,machine,machineColsFor(machine),reg,regNew);
+    if(r.anchored.length&&!window.confirm(anchoredMessage(r.anchored,'Le passage en '+(next==='2x8'?'2×8':'1×8')+' du '+date))){showToast('Changement de régime annulé');return;}
+    await commit({label:'Régime '+next+' '+machine+' '+date,remove:r.remove,add:r.add,
+      aux:[{type:'regime',machine,date,before:cur,after:next}]});
   }
 
-  // Assign un opérateur sur un slot (machine|date|half_day).
-  // - Si le slot cliqué est LUN matin (dow=1, hd=1) → propagation lundi→vendredi (10 slots)
-  // - Sinon → modification individuelle du seul slot cliqué
+  // Lundi matin -> toute la semaine (lun→ven) ; sinon la seule demi-journée
   async function setOperatorAssignment(machine, date, halfDay, operatorId){
     const d=pd(date);
-    const dow=d.getDay(); // 0=dim, 1=lun, …, 6=sam
-    const isMondayMorning=(dow===1 && halfDay===1);
-
-    let keys=[];
-    if(isMondayMorning){
-      // Propagation : lun→ven, matin et AM (10 slots)
-      const targetDates=[];
-      for(let i=0;i<5;i++){
-        const dt=new Date(d); dt.setDate(d.getDate()+i);
-        targetDates.push(fd(dt));
-      }
-      targetDates.forEach(td=>{
-        [1,2].forEach(hd=>{ keys.push({machine,date:td,half_day:hd}); });
-      });
-    } else {
-      // Slot unique
-      keys.push({machine,date,half_day:halfDay});
-    }
-
-    // Optimistic UI
-    const newAssign={...opAssign};
-    keys.forEach(k=>{
-      const kk=k.machine+'|'+k.date+'|'+k.half_day;
-      if(operatorId==null) delete newAssign[kk];
-      else newAssign[kk]=operatorId;
-    });
-    setOpAssign(newAssign);
-
-    busyRef.current=true;
-    try{
-      // DELETE existant pour ces clés (ignorer si rien à supprimer)
-      for(const k of keys){
-        try{
-          await sb('operator_assignments?machine=eq.'+encodeURIComponent(k.machine)+'&date=eq.'+encodeURIComponent(k.date)+'&half_day=eq.'+k.half_day,
-            {method:'DELETE',prefer:'return=minimal'});
-        }catch(e){ console.warn('op_assign DELETE warn',e); }
-      }
-      if(operatorId!=null){
-        const payload=keys.map(k=>({machine:k.machine,date:k.date,half_day:k.half_day,operator_id:operatorId}));
-        try{
-          await sb('operator_assignments',{method:'POST',body:JSON.stringify(payload),prefer:'return=minimal'});
-        }catch(e){
-          console.error('op_assign INSERT error',e);
-          showToast('Erreur opérateur: '+e.message);
-          loadPlanning();
-          return;
-        }
-      }
-    }finally{busyRef.current=false;}
+    const keys=[];
+    if(d.getDay()===1&&halfDay===1){
+      for(let i=0;i<5;i++){const dt=new Date(d);dt.setDate(d.getDate()+i);[1,2].forEach(hd=>keys.push({machine,date:fd(dt),half_day:hd}));}
+    } else keys.push({machine,date,half_day:halfDay});
+    const oa=opAssignRef.current;
+    const items=keys.map(k=>({...k,before:oa[k.machine+'|'+k.date+'|'+k.half_day]||null,after:operatorId||null}))
+      .filter(it=>it.before!==it.after);
+    if(!items.length) return;
+    const op=operators.find(o=>o.id===operatorId);
+    await commit({label:'Opérateur '+(op?op.abrev:'—')+' '+machine+' '+date,aux:[{type:'op',items}],light:true});
   }
-  window._regimes=regimes; // expose for EditModal
-  const today=fd(new Date());
+
+  function openOpPicker(machine,date,hd,e){
+    const rect=e.currentTarget.getBoundingClientRect();
+    setOpPicker({machine,date,hd,x:rect.left,y:rect.bottom+2});
+  }
+
+  window._regimes=regimes;
   const base={machine:'PFC',date:today,half_day:1,slot:1,of_number:'',client:'',designation:'',mac:'',qte:'',format:'',depart:'',conducteur:'',bold:false};
-  // En mode aperçu, on bloque toutes les interactions d'édition
   const isLocked=READONLY||!!previewData;
+
+  // Gestionnaires toujours à jour, utilisés par les parties mémorisées de la grille
+  const H=useRef({});
+  H.current={undo,redo,load,flushRt,rtStatus,toggleRegime,openOpPicker,setSatModal,setModal,openClosure,setReadonlyPopup,onBandDragStart,onBandDragEnd,onResizeStart,base,justResizedRef};
+
+  // ─── PARTIES MÉMORISÉES DE LA GRILLE ─────────────────────────────────────
+  // Elles ne sont reconstruites que si leurs données changent : un
+  // déplacement d'OF ne redessine ni les en-têtes, ni les régimes, ni les
+  // opérateurs.
+  const opById=useMemo(()=>{const m={};operators.forEach(o=>{m[o.id]=o;});return m;},[operators]);
+
+  const headerEls=useMemo(()=>{
+    const out=[];
+    const weeks=[];let cur=null;
+    filteredDates.forEach((date,di)=>{
+      const d=pd(date),wk=getISOWeek(d),key=d.getFullYear()+'W'+wk;
+      if(!cur||cur.key!==key){if(cur)weeks.push(cur);cur={key,wk,si:di,ei:di,par:wk%2};}
+      else cur.ei=di;
+    });
+    if(cur)weeks.push(cur);
+    weeks.forEach(w=>{
+      out.push(
+        <div key={'wk'+w.key} style={{gridRow:1,gridColumn:(2+w.si*2)+'/'+(2+w.ei*2+2),position:'sticky',top:0,zIndex:11,
+          background:w.par===0?'#a8c8e8':'#a8dab8',borderBottom:'1px solid #2a2a2a',borderRight:'1px solid #2a2a2a',
+          display:'flex',alignItems:'center',justifyContent:'center'}}>
+          <span style={{fontSize:12,fontWeight:800,fontFamily:'IBM Plex Mono,monospace',color:'#2a2a1a',letterSpacing:1}}>S {w.wk}</span>
+        </div>);
+    });
+    filteredDates.forEach((date,di)=>{
+      const d=pd(date),dow=d.getDay(),isT=date===today,isSat=dow===6;
+      const wkBg=getISOWeek(d)%2===0?'#c8dff5':'#c8efd4';
+      const bg=isT?'#2a1e00':isSat?'#081828':wkBg;
+      const nc=isT?'#ffd050':isSat?'#7be':'#1a1916';
+      const sc=isT?'#b89030':isSat?'#5aa':'#4a4a40';
+      const colStart=2+di*2;
+      const prevDate=filteredDates[di-1];
+      const prevDow=prevDate?pd(prevDate).getDay():-1;
+      const prevSatDate=prevDate?(()=>{const d2=pd(prevDate);d2.setDate(d2.getDate()+1);return fd(d2);})():null;
+      const satMachines=satConfigs[date]||[];
+      const showBetween=prevDow===5&&dow!==6&&prevSatDate;
+      const showOnSat=isSat&&satMachines.length>0;
+      if(showBetween||showOnSat){
+        const btnDate=showOnSat?date:prevSatDate;
+        const satOpen=(satConfigs[btnDate]||[]).length>0;
+        out.push(
+          <div key={'satb'+date} style={{gridRow:2,gridColumn:showOnSat?(colStart+1)+'/'+(colStart+2):(colStart-1)+'/'+colStart,
+            position:'sticky',top:WKH,zIndex:20,display:'flex',alignItems:'center',justifyContent:'flex-end',pointerEvents:'none'}}>
+            <div onClick={isLocked?undefined:()=>H.current.setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
+              title={satOpen?'Modifier/fermer ce samedi':'Ouvrir ce samedi'}
+              style={{width:16,height:16,borderRadius:'50%',cursor:'pointer',background:satOpen?'#c0392b':'#8a6a20',
+                color:'#fff',fontSize:13,fontWeight:900,display:'flex',alignItems:'center',justifyContent:'center',
+                lineHeight:1,userSelect:'none',pointerEvents:'all',boxShadow:'0 1px 4px rgba(0,0,0,.6)',
+                transform:showOnSat?'translateX(-4px)':'translateX(8px)',border:'1.5px solid rgba(255,255,255,.3)'}}>{satOpen?'−':'+'}</div>
+          </div>);
+      }
+      out.push(
+        <div key={'dh'+date} style={{gridRow:2,gridColumn:colStart+'/'+(colStart+2),position:'sticky',top:WKH,zIndex:10,
+          background:bg,borderBottom:'3px solid #c9a84c',borderRight:'2px solid #3a3a3a',textAlign:'center',padding:'4px 2px 3px',userSelect:'none'}}>
+          <div style={{fontSize:11,color:sc,fontFamily:'IBM Plex Mono,monospace',fontWeight:600,letterSpacing:.3}}>{DAY[dow]}</div>
+          <div style={{fontSize:20,fontWeight:700,color:nc,lineHeight:1.05}}>{d.getDate()}</div>
+          <div style={{fontSize:10,color:sc,fontWeight:600}}>{MON[d.getMonth()]}</div>
+        </div>);
+    });
+    return out;
+  },[filteredDates,satConfigs,isLocked,today]);
+
+  const regimeEls=useMemo(()=>{
+    const res={};
+    MACHINES.forEach((machine,mi)=>{
+      const rReg=3+mi*4;
+      res[machine]=filteredDates.map((date,di)=>{
+        const is2x8=getRegime(regimes,machine,date)==='2x8';
+        const isSat=pd(date).getDay()===6;
+        const isSatOpen=isSat&&(satConfigs[date]||[]).includes(machine);
+        const colStart=2+di*2;
+        return(
+          <div key={'reg'+machine+date}
+            style={{gridRow:rReg,gridColumn:colStart+'/'+(colStart+2),
+              background:isSatOpen?'#fff3c0':is2x8?'#1e5fa8':'transparent',
+              borderBottom:isSatOpen?'1px solid #e0c040':is2x8?'1px solid #14457d':'1px solid #e8e8e0',
+              borderRight:'1px solid #e0e0d8',display:'flex',alignItems:'center',justifyContent:'center',
+              cursor:(isSat||isLocked)?'default':'pointer',userSelect:'none'}}
+            onClick={(isSat||isLocked)?undefined:()=>H.current.toggleRegime(machine,date)}
+            title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}>
+            <span style={{fontSize:isSatOpen||is2x8?12:9,fontFamily:'IBM Plex Mono,monospace',letterSpacing:.5,
+              color:isSatOpen?'#7a6000':is2x8?'#ffffff':'#d8d8d0',fontWeight:isSatOpen||is2x8?800:400}}>
+              {isSatOpen?'Sam':is2x8?'2×8':'1×8'}</span>
+          </div>);
+      });
+    });
+    return res;
+  },[filteredDates,regimes,satConfigs,isLocked]);
+
+  // Lignes opérateur : une case = initiales ; le choix se fait dans un panneau unique
+  const opRowEls=useMemo(()=>{
+    const mk=(key,row)=>filteredSubCols.map((sc,sci)=>{
+      const op=opById[opAssign[key+'|'+sc.date+'|'+sc.hd]];
+      return(
+        <div key={'op'+key+sc.date+sc.hd}
+          onClick={isLocked?undefined:(e)=>H.current.openOpPicker(key,sc.date,sc.hd,e)}
+          title={op?op.nom:'Aucun opérateur'}
+          style={{gridRow:row,gridColumn:sci+2,background:op?op.color:'transparent',
+            borderBottom:'1px solid #d8d8d0',borderRight:'1px solid #e8e5e2',
+            display:'flex',alignItems:'center',justifyContent:'center',
+            cursor:isLocked?'default':'pointer',userSelect:'none',
+            fontFamily:'IBM Plex Mono,monospace',fontSize:11,fontWeight:800,letterSpacing:.3,
+            color:op?textOnColor(op.color):'#bbb'}}>
+          {op?op.abrev:'—'}
+        </div>);
+    });
+    const res={};
+    MACHINES.forEach((machine,mi)=>{res[machine]=mk(machine,4+mi*4);});
+    VIRTUAL_ROWS.forEach((vr,vi)=>{res[vr.key]=mk(vr.key,3+MACHINES.length*4+vi*2);});
+    return res;
+  },[filteredSubCols,opAssign,opById,isLocked]);
+
+  const emptyEls=useMemo(()=>{
+    const res={};
+    MACHINES.forEach((machine,mi)=>{
+      const r1=5+mi*4;
+      const used=new Set((bandsPerMachine[machine]||[]).flatMap(b=>b.special?[b.i]:Array.from({length:b.ei-b.si+1},(_,k)=>b.si+k)));
+      res[machine]=filteredSubCols.map(({date,hd},sci)=>{
+        if(used.has(sci)) return null;
+        const isM=hd===1;
+        if(closures[machine+'|'+date]){
+          if(!isM) return null;
+          return(
+            <div key={'e1'+machine+sci} style={{gridRow:r1,gridColumn:sci+2+'/'+(sci+4),
+              background:'repeating-linear-gradient(45deg,#e8e5e0,#e8e5e0 4px,#f0eee8 4px,#f0eee8 8px)',
+              borderBottom:'1px solid #d0ccc5',borderRight:'1px solid #d0ccc5',cursor:isLocked?'default':'pointer',
+              display:'flex',alignItems:'center',justifyContent:'center'}}
+              onClick={isLocked?undefined:()=>H.current.openClosure(machine,date)}
+              title={'Machine fermée le '+date+' — cliquer pour rouvrir'}>
+              <span style={{fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',fontWeight:700,background:'rgba(255,255,255,.7)',padding:'1px 5px',borderRadius:3}}>🔒 FERMÉ</span>
+            </div>);
+        }
+        return(
+          <div key={'e1'+machine+sci} data-m={machine} className="cell-e"
+            style={{gridRow:r1,gridColumn:sci+2,
+              background:date===today?'rgba(255,215,0,0.06)':isM?'#fafaf8':'#f5f5f2',
+              borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:isM?'none':'1px solid #dddbd3',
+              cursor:isLocked?'default':'pointer'}}
+            onClick={isLocked?undefined:()=>H.current.setModal({type:'add',data:{...H.current.base,machine,date,half_day:hd,slot:1}})}/>);
+      });
+    });
+    return res;
+  },[filteredSubCols,bandsPerMachine,closures,isLocked,today]);
+
+  const bandEls=useMemo(()=>{
+    const res={};
+    MACHINES.forEach((machine,mi)=>{
+      const r1=5+mi*4;
+      res[machine]=(bandsPerMachine[machine]||[]).map((band,bi)=>{
+        if(band.special){
+          return <div key={'sp1'+machine+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
+            onClick={isLocked?undefined:()=>H.current.setModal({type:'edit',data:{...band.row}})}>
+            <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
+          </div>;
+        }
+        const isDone=getDone(band.fr);
+        const color=isDone?'#b0b0b0':ofColorKey(band.fr);
+        const lastRow=band.rows[band.rows.length-1];
+        const dc=isDone?null:getDeadlineColor(band.depart,lastRow.date,sat);
+        const tc=contrastColor(color);
+        const isRs=resizeSrc&&resizeSrc.machine===machine&&resizeSrc.band.k===band.k;
+        const dep=band.depart?(()=>{const p=band.depart.split('/');return p.length>=2?p[0]+'/'+p[1]:band.depart;})():null;
+        return(
+          <div key={'b1'+band.k} data-m={machine} style={{
+            gridRow:r1,gridColumn:(band.si+2)+'/'+(band.ei+3),
+            background:color,borderBottom:'1px solid rgba(0,0,0,.07)',borderRight:'1px solid rgba(0,0,0,.08)',
+            borderRadius:'4px 4px 0 0',padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
+            cursor:isLocked?'pointer':'grab',
+            backgroundImage:(isDone||band.bold)?'none':`repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px),linear-gradient(${color},${color})`,
+            zIndex:1}}
+            draggable={!isLocked}
+            onDragStart={isLocked?undefined:e=>H.current.onBandDragStart(e,band.fr)}
+            onDragEnd={isLocked?undefined:()=>H.current.onBandDragEnd()}
+            onClick={isLocked?(e)=>H.current.setReadonlyPopup({band,x:e.clientX,y:e.clientY}):()=>{if(H.current.justResizedRef.current)return;H.current.setModal({type:'edit',data:{...band.fr}});}}
+            title={['OF : '+(band.of_number||'—'),band.designation||'',band.fr.mac?'MAC : '+band.fr.mac:'',
+              [band.fr.format,dep].filter(Boolean).join(' - '),getObs(band.fr)?'Obs : '+getObs(band.fr):'',isDone?'OF terminé (fixe)':''].filter(Boolean).join('\n')}>
+            {dc&&<div style={{position:'absolute',top:0,right:0,width:dc==='#e8001a'?8:4,height:'100%',background:dc,borderRadius:'0 4px 4px 0'}}/>}
+            <div style={{fontSize:14,fontWeight:700,color:tc,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.25}}>{band.client}</div>
+            {band.designation&&<div style={{fontSize:13,color:tc,opacity:.75,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.2}}>{band.designation}</div>}
+            {band.fr.qte&&<div style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{band.fr.qte}</div>}
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-end',marginTop:1,paddingRight:10}}>
+              {band.fr.format?<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,whiteSpace:'nowrap'}}>{band.fr.format}</span>:<span/>}
+              {dep&&<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,whiteSpace:'nowrap',marginLeft:'auto'}}>{dep}</span>}
+            </div>
+            {!isLocked&&<div onMouseDown={e=>H.current.onResizeStart(e,band,1,machine)}
+              style={{position:'absolute',top:0,right:0,width:6,height:'100%',cursor:'ew-resize',zIndex:4}}
+              onClick={e=>e.stopPropagation()}/>}
+            {isRs&&(
+              <div style={{position:'absolute',inset:0,pointerEvents:'none',background:'rgba(255,255,255,.35)',
+                outline:'2px dashed #8a6a20',outlineOffset:'-2px',borderRadius:'inherit',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                <span style={{fontSize:13,fontWeight:700,color:'#1a1916',fontFamily:'IBM Plex Mono,monospace',
+                  background:'rgba(255,255,255,.85)',padding:'2px 8px',borderRadius:4,boxShadow:'0 1px 4px rgba(0,0,0,.2)'}}>
+                  {(()=>{
+                    const cols=machineColsFor(machine);
+                    const fr=resizeSrc.band.rows[0];
+                    const st=cols.findIndex(c=>c.date===fr.date&&c.hd===(fr.half_day||1));
+                    let eq=0;
+                    for(let i=0;i<resizeSrc.curDur&&st>=0;i++){const c=cols[st+i];if(!c)break;eq+=(getRegime(regimes,machine,c.date)==='2x8'?1:0.5);}
+                    return eq;
+                  })()} éq
+                </span>
+              </div>
+            )}
+          </div>);
+      });
+    });
+    return res;
+  },[bandsPerMachine,resizeSrc,isLocked,regimes]);
 
   if(loading)return(
     <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',gap:12,color:'#888',fontFamily:'IBM Plex Mono,monospace'}}>
@@ -1657,9 +1598,13 @@ function App(){
   );
 
   const nSC=filteredSubCols.length;
-  // grid: label col + 2 sub-cols per day
   const gTC=LW+'px repeat('+nSC+', '+hdw+'px)';
   const gTR=WKH+'px '+HDR+'px '+MACHINES.map(()=>RGH+'px '+ROH+'px '+RH+'px '+GTH+'px').join(' ')+' '+VIRTUAL_ROWS.map(()=>ROH+'px '+GTH+'px').join(' ');
+  const canUndo=histRef.current.undo.length>0, canRedo=histRef.current.redo.length>0;
+  const hiddenBefore=!showHistory&&!q&&!previewData&&activeDates.length>0&&pd(activeDates[0])<histStartDate;
+
+  const tbBtn=(enabled)=>({display:'flex',alignItems:'center',gap:6,padding:'6px 13px',borderRadius:5,border:'1px solid #b8b5aa',
+    background:'#fff',color:enabled?'#555':'#bbb',fontSize:12,fontWeight:600,cursor:enabled?'pointer':'default',fontFamily:'IBM Plex Sans,sans-serif'});
 
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden'}}>
@@ -1670,9 +1615,11 @@ function App(){
           <div style={{fontSize:14,fontWeight:700,color:'#f5f4f0',marginTop:2}}>Planning Production</div>
         </div>
         <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,fontSize:11,color:'#aaa'}}>
-          <div style={{width:7,height:7,borderRadius:'50%',background:previewData?'#e67e22':'#4faa7a',animation:'pulse 2s infinite'}}/>
-          {activeRows.length} entrées · {previewData?<span style={{color:'#e67e22',fontWeight:700}}>APERÇU SNAPSHOT</span>:'auto-sync'}
-          {sat&&<span style={{background:'#0d3030',color:'#7dd',padding:'2px 8px',borderRadius:10,fontSize:10}}>Sam. ouvert</span>}
+          <div style={{width:7,height:7,borderRadius:'50%',background:previewData?'#e67e22':rtStatus==='live'?'#4faa7a':rtStatus==='off'?'#e67e22':'#888',animation:'pulse 2s infinite'}}/>
+          {activeRows.length} entrées · {previewData?<span style={{color:'#e67e22',fontWeight:700}}>APERÇU SNAPSHOT</span>
+            :rtStatus==='live'?'temps réel'
+            :rtStatus==='off'?<span style={{color:'#e67e22'}} title="Les modifications des autres postes n'arrivent plus. Rechargez la page (F5).">hors ligne — F5 pour actualiser</span>
+            :'connexion…'}
           <button onClick={()=>setShowSet(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>⚙ Paramètres</button>
           <button onClick={()=>setShowClients(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>👥 Clients</button>
           <button onClick={()=>setShowOperators(true)} style={{padding:'5px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#ccc',fontSize:11,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif'}}>🧑‍🏭 Personnes</button>
@@ -1682,20 +1629,11 @@ function App(){
 
       {/* BANNIÈRE APERÇU SNAPSHOT */}
       {previewData&&(
-        <div style={{
-          display:'flex',alignItems:'center',gap:16,
-          padding:'10px 20px',
-          background:'#fff3cd',borderBottom:'2px solid #e67e22',
-          flexShrink:0,zIndex:50,
-        }}>
+        <div style={{display:'flex',alignItems:'center',gap:16,padding:'10px 20px',background:'#fff3cd',borderBottom:'2px solid #e67e22',flexShrink:0,zIndex:50}}>
           <span style={{fontSize:22}}>👁</span>
           <div style={{flex:1}}>
-            <div style={{fontWeight:700,color:'#7d4e00',fontSize:13}}>
-              Aperçu du snapshot du {previewData.backupDate} — lecture seule
-            </div>
-            <div style={{fontSize:11,color:'#a06000',marginTop:2}}>
-              Vous consultez une version archivée du planning. Aucune modification n'est possible dans ce mode.
-            </div>
+            <div style={{fontWeight:700,color:'#7d4e00',fontSize:13}}>Aperçu du snapshot du {previewData.backupDate} — lecture seule</div>
+            <div style={{fontSize:11,color:'#a06000',marginTop:2}}>Vous consultez une version archivée du planning. Aucune modification n'est possible dans ce mode.</div>
           </div>
           <button onClick={async()=>{
             if(!window.confirm('Remplacer le planning actuel par cette version du '+previewData.backupDate+' ?\n\nCette action est irréversible (sauf si une sauvegarde d\'aujourd\'hui existe déjà).')) return;
@@ -1705,18 +1643,10 @@ function App(){
               setPreviewData(null);
               load();
             }catch(e){showToast('Erreur restauration : '+e.message);}
-          }} style={{
-            padding:'8px 18px',borderRadius:6,border:'none',
-            background:'#e67e22',color:'#fff',fontSize:12,fontWeight:700,
-            cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0,
-          }}>
+          }} style={{padding:'8px 18px',borderRadius:6,border:'none',background:'#e67e22',color:'#fff',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0}}>
             ✓ Restaurer cette version
           </button>
-          <button onClick={()=>{setPreviewData(null);}} style={{
-            padding:'8px 14px',borderRadius:6,border:'1px solid #c9a84c',
-            background:'#fff',color:'#7d4e00',fontSize:12,fontWeight:600,
-            cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0,
-          }}>
+          <button onClick={()=>{setPreviewData(null);}} style={{padding:'8px 14px',borderRadius:6,border:'1px solid #c9a84c',background:'#fff',color:'#7d4e00',fontSize:12,fontWeight:600,cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',flexShrink:0}}>
             ✕ Annuler l'aperçu
           </button>
         </div>
@@ -1728,535 +1658,100 @@ function App(){
           placeholder="🔍  Client, OF, désignation…" value={q} onChange={e=>setQ(e.target.value)}/>
         <div style={{width:1,height:22,background:'#ddd'}}/>
         {!isLocked&&<button className="btn btn-primary" onClick={()=>setModal({type:'add',data:{...base}})}>+ Nouvel OF</button>}
-        {!isLocked&&<button onClick={()=>{
-          const todayIdx=filteredDates.indexOf(today);
-          if(todayIdx>=0&&gridRef.current)
-            gridRef.current.scrollLeft=Math.max(0,LW+(todayIdx*2-5)*hdw-80);
-        }} title="Recentrer sur aujourd'hui" style={{
-          padding:'6px 13px',borderRadius:5,border:'1px solid #b8b5aa',
-          background:'#fff',color:'#555',fontSize:12,fontWeight:600,
-          cursor:'pointer',fontFamily:'IBM Plex Sans,sans-serif',transition:'all .15s'
-        }}
-          onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';}}
-          onMouseLeave={e=>{e.currentTarget.style.background='#fff';}}
-        >📅 Aujourd'hui</button>}
-        {!isLocked&&<button onClick={undo} title="Annuler la dernière action (Ctrl+Z)" style={{
-          display:'flex',alignItems:'center',gap:6,
-          padding:'6px 13px',borderRadius:5,
-          border:'1px solid #b8b5aa',background:'#fff',
-          color:'#555',fontSize:12,fontWeight:600,cursor:'pointer',
-          fontFamily:'IBM Plex Sans,sans-serif',transition:'all .15s'
-        }}
-          onMouseEnter={e=>{e.currentTarget.style.background='#f0efe9';e.currentTarget.style.color='#1a1916';}}
-          onMouseLeave={e=>{e.currentTarget.style.background='#fff';e.currentTarget.style.color='#555';}}
-        >
+        <button onClick={()=>{
+          const idx=filteredDates.indexOf(today);
+          if(idx>=0&&gridRef.current) gridRef.current.scrollLeft=Math.max(0,LW+(idx*2-5)*hdw-80);
+        }} title="Recentrer sur aujourd'hui" style={tbBtn(true)}>📅 Aujourd'hui</button>
+        <button onClick={toggleHistory} title={showHistory?'Masquer les semaines passées':'Afficher les semaines antérieures à '+fd(histStartDate)}
+          style={{...tbBtn(true),background:showHistory?'#f0efe9':'#fff'}}>
+          📜 {showHistory?'Masquer l’historique':'Afficher l’historique'}
+        </button>
+        {!isLocked&&<button onClick={undo} disabled={!canUndo} title="Annuler la dernière action (Ctrl+Z)" style={tbBtn(canUndo)}>
           <span style={{fontSize:16,lineHeight:1}}>↩</span> Annuler
         </button>}
+        {!isLocked&&<button onClick={redo} disabled={!canRedo} title="Rétablir l'action annulée (Ctrl+Y)" style={tbBtn(canRedo)}>
+          <span style={{fontSize:16,lineHeight:1}}>↪</span> Rétablir
+        </button>}
         <div style={{display:'flex',alignItems:'center',gap:2,border:'1px solid #b8b5aa',borderRadius:5,overflow:'hidden'}}>
-          <button onClick={zoomOut} title="Zoom arrière" style={{
-            padding:'6px 10px',border:'none',background:'#fff',
-            color:'#555',fontSize:14,cursor:hdw<=24?'not-allowed':'pointer',
-            fontFamily:'IBM Plex Sans,sans-serif',opacity:hdw<=24?.4:1,lineHeight:1
-          }}>🔍−</button>
-          <span style={{fontSize:11,color:'#888',padding:'0 6px',borderLeft:'1px solid #e0e0d8',borderRight:'1px solid #e0e0d8',userSelect:'none',lineHeight:'28px'}}>
-            {Math.round(hdw/50*100)}%
-          </span>
-          <button onClick={zoomIn} title="Zoom avant" style={{
-            padding:'6px 10px',border:'none',background:'#fff',
-            color:'#555',fontSize:14,cursor:hdw>=120?'not-allowed':'pointer',
-            fontFamily:'IBM Plex Sans,sans-serif',opacity:hdw>=120?.4:1,lineHeight:1
-          }}>🔍+</button>
+          <button onClick={zoomOut} title="Zoom arrière" style={{padding:'6px 10px',border:'none',background:'#fff',color:'#555',fontSize:14,cursor:hdw<=24?'not-allowed':'pointer',opacity:hdw<=24?.4:1,lineHeight:1}}>🔍−</button>
+          <span style={{fontSize:11,color:'#888',padding:'0 6px',borderLeft:'1px solid #e0e0d8',borderRight:'1px solid #e0e0d8',userSelect:'none',lineHeight:'28px'}}>{Math.round(hdw/50*100)}%</span>
+          <button onClick={zoomIn} title="Zoom avant" style={{padding:'6px 10px',border:'none',background:'#fff',color:'#555',fontSize:14,cursor:hdw>=120?'not-allowed':'pointer',opacity:hdw>=120?.4:1,lineHeight:1}}>🔍+</button>
         </div>
         <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:12,fontSize:11,color:'#888'}}>
-          <span style={{display:'flex',alignItems:'center',gap:5}}>
-            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#d0f0cc'}}/>Reçu</span>
-          <span style={{display:'flex',alignItems:'center',gap:5}}>
-            <span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'repeating-linear-gradient(135deg,#dce8ff,#dce8ff 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px)'}}/>En attente</span>
-          <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e67e22'}}/> Départ dans ≤2j ouvrés</span>
+          <span style={{display:'flex',alignItems:'center',gap:5}}><span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#d0f0cc'}}/>Reçu</span>
+          <span style={{display:'flex',alignItems:'center',gap:5}}><span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'repeating-linear-gradient(135deg,#dce8ff,#dce8ff 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px)'}}/>En attente</span>
+          <span style={{display:'flex',alignItems:'center',gap:5}}><span style={{display:'inline-block',width:20,height:10,borderRadius:2,background:'#b0b0b0'}}/>Terminé (fixe)</span>
+          <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e67e22'}}/> Départ ≤2j ouvrés</span>
           <span style={{display:'flex',alignItems:'center',gap:4}}><span style={{display:'inline-block',width:4,height:14,borderRadius:2,background:'#e8001a'}}/> Départ dépassé</span>
-          <span style={{fontSize:10,color:'#bbb'}}>Glisser = déplacer · Cliquer = éditer</span>
         </div>
       </div>
 
       {/* GRID */}
-      <div ref={gridRef} style={{flex:1,overflow:'auto',background:'#f0f0ec',cursor:resizeSrc?'ew-resize':'default'}}>
+      <div ref={gridRef} onDragOver={isLocked?undefined:onGridDragOver} onDrop={isLocked?undefined:onGridDrop}
+        style={{flex:1,overflow:'auto',background:'#f0f0ec',cursor:resizeSrc?'ew-resize':'default'}}>
         <div style={{display:'grid',gridTemplateColumns:gTC,gridTemplateRows:gTR,minWidth:LW+nSC*hdw,position:'relative'}}>
 
-          {/* LIGNE AUJOURD'HUI — traverse toutes les lignes */}
           {(()=>{
             const todayIdx=filteredDates.indexOf(today);
             if(todayIdx<0) return null;
-            const left=LW+todayIdx*2*hdw;
-            const totalRows=2+MACHINES.length*4+VIRTUAL_ROWS.length*2;
-            return(
-              <div style={{
-                position:'absolute',top:0,bottom:0,
-                left:left,width:hdw*2,
-                background:'rgba(255,215,0,0.06)',
-                pointerEvents:'none',zIndex:0,
-              }}/>
-            );
+            return <div style={{position:'absolute',top:0,bottom:0,left:LW+todayIdx*2*hdw,width:hdw*2,background:'rgba(255,215,0,0.06)',pointerEvents:'none',zIndex:0}}/>;
           })()}
 
           {/* CORNER */}
           <div style={{gridRow:'1/3',gridColumn:1,position:'sticky',top:0,left:0,zIndex:30,
             background:'#000',borderRight:'2px solid #c9a84c',borderBottom:'3px solid #c9a84c',
-            padding:'8px 10px',display:'flex',alignItems:'flex-end',
+            padding:'8px 10px',display:'flex',flexDirection:'column',justifyContent:'flex-end',
             fontFamily:'IBM Plex Mono,monospace',fontSize:10,fontWeight:600,color:'#c9a84c',letterSpacing:1}}>
+            {hiddenBefore&&<div onClick={toggleHistory} style={{cursor:'pointer',fontSize:9,color:'#888',letterSpacing:0,marginBottom:6,fontWeight:400}} title="Afficher l'historique">◀ avant le {fd(histStartDate)}</div>}
             MACHINE
           </div>
 
-          {/* WEEK BANDEAUX — row 1 */}
-          {(()=>{
-            const weeks=[];let cur=null;
-            filteredDates.forEach((date,di)=>{
-              const d=pd(date),wk=getISOWeek(d),yr=d.getFullYear(),key=yr+'W'+wk;
-              if(!cur||cur.key!==key){if(cur)weeks.push(cur);cur={key,wk,si:di,ei:di,par:wk%2};}
-              else cur.ei=di;
-            });
-            if(cur)weeks.push(cur);
-            return weeks.map(w=>{
-              const cs=2+w.si*2,ce=2+w.ei*2+2;
-              const bg=w.par===0?'#a8c8e8':'#a8dab8';
-              return(
-                <div key={w.key} style={{
-                  gridRow:1,gridColumn:cs+'/'+ce,
-                  position:'sticky',top:0,zIndex:11,
-                  background:bg,
-                  borderBottom:'1px solid #2a2a2a',
-                  borderRight:'1px solid #2a2a2a',
-                  display:'flex',alignItems:'center',justifyContent:'center',
-                }}>
-                  <span style={{fontSize:12,fontWeight:800,fontFamily:'IBM Plex Mono,monospace',color:'#2a2a1a',letterSpacing:1}}>
-                    S {w.wk}
-                  </span>
-                </div>
-              );
-            });
-          })()}
+          {headerEls}
 
-          {/* DATE HEADERS — row 2, each spans 2 sub-cols */}
-          {filteredDates.map((date,di)=>{
-            const d=pd(date),dow=d.getDay(),isT=date===today;
-            const isSat=dow===6;
-            const wk=getISOWeek(d),par=wk%2;
-            // Alternate week colors (preserving today/sat highlights)
-            const wkBg=par===0?'#c8dff5':'#c8efd4';
-            const bg=isT?'#2a1e00':isSat?'#081828':wkBg;
-            const nc=isT?'#ffd050':isSat?'#7be':'#1a1916';
-            const sc=isT?'#b89030':isSat?'#5aa':'#4a4a40';
-            const colStart=2+di*2;
-            const prevDate=filteredDates[di-1];
-            const prevDow=prevDate?pd(prevDate).getDay():-1;
-            const prevSatDate=prevDate?(()=>{var d2=pd(prevDate);d2.setDate(d2.getDate()+1);return fd(d2);})():null;
-            const satMachines=satConfigs[date]||[];
-            return(<React.Fragment key={date}>
-              {(()=>{
-                const showBetween=prevDow===5&&dow!==6&&prevSatDate;
-                const showOnSat=isSat&&satMachines.length>0;
-                if(!showBetween&&!showOnSat) return null;
-                const btnDate=showOnSat?date:prevSatDate;
-                const satOpen=(satConfigs[btnDate]||[]).length>0;
-                return(
-                  <div style={{
-                    gridRow:2,
-                    gridColumn:showOnSat?(colStart+1)+'/'+(colStart+2):(colStart-1)+'/'+colStart,
-                    position:'sticky',top:WKH,zIndex:20,
-                    display:'flex',alignItems:'center',
-                    justifyContent:showOnSat?'flex-end':'flex-end',
-                    pointerEvents:'none',
-                  }}>
-                    <div onClick={isLocked?undefined:()=>setSatModal({date:btnDate,machines:satConfigs[btnDate]||[]})}
-                      title={satOpen?'Modifier/fermer ce samedi':'Ouvrir ce samedi'}
-                      style={{
-                        width:16,height:16,borderRadius:'50%',cursor:'pointer',
-                        background:satOpen?'#c0392b':'#8a6a20',
-                        color:'#fff',fontSize:13,fontWeight:900,
-                        display:'flex',alignItems:'center',justifyContent:'center',
-                        lineHeight:1,userSelect:'none',pointerEvents:'all',
-                        boxShadow:'0 1px 4px rgba(0,0,0,.6)',
-                        transform:showOnSat?'translateX(-4px)':'translateX(8px)',
-                        border:'1.5px solid rgba(255,255,255,.3)',
-                      }}>{satOpen?'−':'+'}</div>
-                  </div>
-                );
-              })()}
-              <div style={{
-                gridRow:2,gridColumn:colStart+'/'+(colStart+2),
-                position:'sticky',top:WKH,zIndex:10,
-                background:bg,
-                borderBottom:'3px solid #c9a84c',
-                borderRight:'2px solid #3a3a3a',
-                textAlign:'center',padding:'4px 2px 3px',userSelect:'none'
-              }}>
-                <div style={{fontSize:11,color:sc,fontFamily:'IBM Plex Mono,monospace',fontWeight:600,letterSpacing:.3}}>{DAY[dow]}</div>
-                <div style={{fontSize:20,fontWeight:700,color:nc,lineHeight:1.05}}>{d.getDate()}</div>
-                <div style={{fontSize:10,color:sc,fontWeight:600}}>{MON[d.getMonth()]}</div>
-              </div>
-              {isSat&&(satConfigs[date]||[]).length>0&&(
-                <div style={{gridRow:2,gridColumn:(di*2+2)+'/'+(di*2+4),
-                  display:'flex',alignItems:'flex-end',justifyContent:'flex-end',
-                  pointerEvents:'none',position:'relative'}}>
-                  <button onClick={()=>setSatModal({date,machines:satConfigs[date]||[]})}
-                    style={{pointerEvents:'all',position:'absolute',top:4,right:4,
-                      padding:'1px 6px',fontSize:9,borderRadius:3,border:'1px solid #aaa',
-                      background:'rgba(255,255,255,.8)',cursor:'pointer',color:'#555'}}>✏</button>
-                </div>
-              )}
-            </React.Fragment>);
-          })}
-
-          {/* Sub-header row (M/AM labels) — sticky just below date header */}
-          {/* We embed M/AM in the half-day cells as tiny labels instead */}
-
-          {/* MACHINE ROWS */}
           {MACHINES.map((machine,mi)=>{
-            const rReg=3+mi*4, rOp=4+mi*4, r1=5+mi*4;
-            const dMode=getModeForDate(sets,machine,today);
-            const b1=bandsPerMachine[machine]||[];
+            const rReg=3+mi*4, r1=5+mi*4;
             const mc=MACHINE_COLORS[machine]||{bg:'#fff',text:'#1a1916'};
-
-            const used1=new Set(b1.flatMap(b=>b.special?[b.i]:Array.from({length:b.ei-b.si+1},(_,k)=>b.si+k)));
-
             return(
               <React.Fragment key={machine}>
-                {/* LABEL spans all 3 rows (regime + operator + slot) */}
-                <div style={{
-                  gridRow:rReg+'/'+(r1+1),gridColumn:1,
-                  position:'sticky',left:0,zIndex:5,
+                <div style={{gridRow:rReg+'/'+(r1+1),gridColumn:1,position:'sticky',left:0,zIndex:5,
                   background:mc.bg,borderRight:'2px solid #b8b5aa',borderBottom:'2px solid #ccc',
-                  padding:'0 10px',display:'flex',flexDirection:'column',justifyContent:'center',
-                  height:RGH+ROH+RH
-                }}>
+                  padding:'0 10px',display:'flex',flexDirection:'column',justifyContent:'center',height:RGH+ROH+RH}}>
                   <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:13,fontWeight:700,color:mc.text}}>{machine}</div>
                 </div>
-
-                {/* REGIME ROW — one cell per day */}
-                {filteredDates.map((date,di)=>{
-                  const mode=getRegime(regimes,machine,date);
-                  const is2x8=mode==='2x8';
-                  const isSatOpen=isSaturdayDate(date)&&(satConfigs[date]||[]).includes(machine);
-                  const isSat=isSaturdayDate(date);
-                  const colStart=2+di*2;
-                  return(
-                    <div key={'reg'+date}
-                      style={{
-                        gridRow:rReg, gridColumn:colStart+'/'+(colStart+2),
-                        background:isSatOpen?'#fff3c0':is2x8?'#1e5fa8':'transparent',
-                        borderBottom:isSatOpen?'1px solid #e0c040':is2x8?'1px solid #14457d':'1px solid #e8e8e0',
-                        borderRight:'1px solid #e0e0d8',
-                        display:'flex',alignItems:'center',justifyContent:'center',
-                        cursor:isSat?'default':'pointer',userSelect:'none',
-                        transition:'background .15s',
-                      }}
-                      onClick={(isSat||isLocked)?undefined:()=>toggleRegime(machine,date)}
-                      title={isSat?'Samedi — 1 équipe':is2x8?'2×8 — cliquer pour passer en 1×8':'1×8 — cliquer pour passer en 2×8'}
-                    >
-                      <span style={{
-                        fontSize:isSatOpen||is2x8?12:9,
-                        fontFamily:'IBM Plex Mono,monospace',
-                        letterSpacing:.5,
-                        color:isSatOpen?'#7a6000':is2x8?'#ffffff':'#d8d8d0',
-                        fontWeight:isSatOpen||is2x8?800:400,
-                      }}>{isSatOpen?'Sam':is2x8?'2×8':'1×8'}</span>
-                    </div>
-                  );
-                })}
-
-                {/* OPERATOR ROW — one cell per half-day slot */}
-                {filteredSubCols.map((sc,sci)=>{
-                  const k=machine+'|'+sc.date+'|'+sc.hd;
-                  const assignedId=opAssign[k];
-                  const op=assignedId?operators.find(o=>o.id===assignedId):null;
-                  const bg=op?op.color:'transparent';
-                  const fg=op?textOnColor(op.color):'#888';
-                  // Liste dispo : non-archivés
-                  const availOps=operators.filter(o=>!o.archived);
-                  return(
-                    <div key={'op'+sc.date+sc.hd}
-                      style={{
-                        gridRow:rOp, gridColumn:sci+2,
-                        background:bg,
-                        borderBottom:'1px solid #d8d8d0',
-                        borderRight:'1px solid #e8e5e2',
-                        display:'flex',alignItems:'center',justifyContent:'center',
-                        position:'relative',
-                        padding:0,
-                      }}
-                      title={op?op.nom:'Aucun opérateur'}
-                    >
-                      <select
-                        value={assignedId||''}
-                        disabled={isLocked}
-                        onChange={e=>{
-                          const v=e.target.value;
-                          setOperatorAssignment(machine,sc.date,sc.hd,v===''?null:v);
-                        }}
-                        style={{
-                          width:'100%',height:'100%',
-                          border:'none',outline:'none',
-                          background:'transparent',
-                          color:fg,
-                          fontFamily:'IBM Plex Mono,monospace',
-                          fontSize:11,fontWeight:700,letterSpacing:.3,
-                          textAlign:'center',textAlignLast:'center',
-                          cursor:isLocked?'default':'pointer',
-                          appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
-                          padding:0,
-                        }}
-                      >
-                        <option value="" style={{background:'#fff',color:'#888'}}>—</option>
-                        {availOps.map(o=>(
-                          <option key={o.id} value={o.id}
-                            style={{background:o.color,color:textOnColor(o.color),fontWeight:700}}>
-                            {o.abrev}
-                          </option>
-                        ))}
-                      </select>
-                      {op&&(
-                        <span style={{
-                          position:'absolute',pointerEvents:'none',
-                          fontFamily:'IBM Plex Mono,monospace',
-                          fontSize:11,fontWeight:800,letterSpacing:.3,
-                          color:fg,
-                        }}>{op.abrev}</span>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Slot 1 bands */}
-                {b1.map((band,bi)=>{
-                  if(band.special){
-                    return <div key={'sp1'+bi} style={{gridRow:r1,gridColumn:band.i+2,background:'#f0ecec',borderBottom:'1px solid rgba(0,0,0,.04)',borderRight:'1px solid #e8e5e2',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer'}}
-                      onClick={isLocked?undefined:()=>setModal({type:'edit',data:{...band.row}})}
-                    >
-                      <span style={{fontSize:7,color:'#ccc',fontFamily:'IBM Plex Mono,monospace'}}>{band.type.slice(0,3)}</span>
-                    </div>;
-                  }
-                  const isDrg=dragSrc&&band.of_number===dragSrc.of_number&&band.client===dragSrc.client&&band.designation===dragSrc.designation;
-                  const isDone=getDone(band.fr);
-                  const color=isDone?'#b0b0b0':ofColorKey(band.fr);
-                  const span=band.ei-band.si+1;
-                  const k=machine+'|'+band.rows[0].date+'|'+(band.rows[0].half_day||1)+'|1';
-                  return(
-                    <div key={'b1'+bi} style={{
-                      gridRow:r1,gridColumn:(band.si+2)+'/'+(band.ei+3),
-                      background:color,opacity:isDrg?.4:1,
-                      borderBottom:'1px solid rgba(0,0,0,.07)',
-                      borderRight:span>1?'1px solid rgba(0,0,0,.08)':'1px solid rgba(0,0,0,.08)',
-                      borderRadius:'4px 4px 0 0',
-                      padding:'2px 5px 1px 8px',position:'relative',overflow:'hidden',
-                      cursor:isLocked?'pointer':'grab',
-                      
-                      backgroundImage:(isDone||band.bold)?'none':`repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(0,0,0,0.10) 4px,rgba(0,0,0,0.10) 6px),linear-gradient(${color},${color})`,
-                      zIndex:1,
-                    }}
-                      draggable={!isLocked&&!resizeSrc} onDragStart={isLocked?undefined:e=>onDS(e,band.fr)}
-                      onDragOver={isLocked?undefined:e=>onDO(e,k)} onDragLeave={isLocked?undefined:onDL}
-                      onDrop={isLocked?undefined:e=>{const t=dropTargetFromX(e.clientX);if(t)onDrop(e,machine,t.date,t.hd,1);}}
-                      onClick={isLocked?(e)=>setReadonlyPopup({band,x:e.clientX,y:e.clientY}):()=>{if(justResizedRef.current)return;setModal({type:'edit',data:{...band.fr}})}}
-                      title={[
-                        'OF : '+(band.of_number||'—'),
-                        band.designation||'',
-                        band.fr.mac?'MAC : '+band.fr.mac:'',
-                        [band.fr.format, band.depart?(()=>{const p=band.depart.split('/');return p.length>=2?p[0]+'/'+p[1]:band.depart;})():null].filter(Boolean).join(' - '),
-                        getObs(band.fr)?'Obs : '+getObs(band.fr):'',
-                      ].filter(Boolean).join('\n')}
-                    >
-                      {(()=>{const lastRow=band.rows[band.rows.length-1];const dc=isDone?null:getDeadlineColor(band.depart,lastRow.date,sat);return dc&&<div style={{position:'absolute',top:0,right:0,width:dc==='#e8001a'?8:4,height:'100%',background:dc,borderRadius:'0 4px 4px 0'}}/>})()}
-                      {(()=>{const tc=contrastColor(color);return(<>
-                        <div style={{fontSize:14,fontWeight:700,color:tc,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.25}}>{band.client}</div>
-                        {band.designation&&<div style={{fontSize:13,color:tc,opacity:.75,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',lineHeight:1.2}}>{band.designation}</div>}
-                        {band.fr.qte&&<div style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{band.fr.qte}</div>}
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-end',marginTop:1,paddingRight:10}}>
-                          {band.fr.format?<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap'}}>{band.fr.format}</span>:<span/>}
-                          {band.depart&&<span style={{fontSize:12,fontWeight:700,color:tc,opacity:.8,fontFamily:'IBM Plex Sans,sans-serif',whiteSpace:'nowrap',marginLeft:'auto'}}>
-                            {(()=>{const p=band.depart.split('/');return p.length>=2?p[0]+'/'+p[1]:band.depart;})()}
-                          </span>}
-                        </div>
-                      </>);})()}
-                      {dragOver===k&&<div style={{position:'absolute',inset:0,border:'2px solid #8a6a20',borderRadius:'inherit',pointerEvents:'none'}}/>}
-                      {/* Resize handle — right edge */}
-                      <div onMouseDown={isLocked?undefined:e=>onResizeStart(e,band,1,machine)}
-                        style={{position:'absolute',top:0,right:0,width:6,height:'100%',cursor:'ew-resize',zIndex:4,
-                          background:'rgba(0,0,0,.0)'}}
-                        onClick={e=>e.stopPropagation()}/>
-                      {/* Resize preview overlay */}
-                      {resizeSrc&&resizeSrc.band.of_number===band.of_number&&resizeSrc.band.client===band.client&&resizeSrc.band.designation===band.designation&&resizeSrc.slot===1&&resizeSrc.machine===machine&&(
-                        <div style={{position:'absolute',inset:0,pointerEvents:'none',
-                          background:'rgba(255,255,255,.35)',
-                          outline:'2px dashed #8a6a20',outlineOffset:'-2px',borderRadius:'inherit',
-                          display:'flex',alignItems:'center',justifyContent:'center'}}>
-                          <span style={{fontSize:13,fontWeight:700,color:'#1a1916',fontFamily:'IBM Plex Mono,monospace',
-                            background:'rgba(255,255,255,.85)',padding:'2px 8px',borderRadius:4,boxShadow:'0 1px 4px rgba(0,0,0,.2)'}}>
-                            {(()=>{
-                              const firstRow=resizeSrc.band.rows[0];
-                              const startIdx=subColsMap.get(firstRow.date+'|'+(firstRow.half_day||1));
-                              let eq=0;
-                              for(let i=0;i<resizeSrc.curDur;i++){
-                                const sc=subCols[startIdx+i];
-                                if(!sc) break;
-                                const m=getRegime(regimes,resizeSrc.machine,sc.date);
-                                eq+=(m==='2x8'?1:0.5);
-                              }
-                              return eq;
-                            })()} éq
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Slot 1 empties */}
-                {filteredSubCols.map(({date,hd},sci)=>{
-                  if(used1.has(sci))return null;
-                  const k=machine+'|'+date+'|'+hd+'|1';
-                  const isM=hd===1;
-                  const isClosed=closures[machine+'|'+date];
-                  if(isClosed){
-                    // Afficher seulement le matin (span 2 demi-j) avec hachuré
-                    if(!isM) return null;
-                    return(
-                      <div key={'e1'+sci} style={{
-                        gridRow:r1,gridColumn:sci+2+'/'+(sci+4),
-                        background:'repeating-linear-gradient(45deg,#e8e5e0,#e8e5e0 4px,#f0eee8 4px,#f0eee8 8px)',
-                        borderBottom:'1px solid #d0ccc5',borderRight:'1px solid #d0ccc5',
-                        cursor:'pointer',position:'relative',
-                        display:'flex',alignItems:'center',justifyContent:'center',
-                      }}
-                        onClick={isLocked?undefined:()=>openClosure(machine,date)}
-                        title={`Machine fermée le ${date} — cliquer pour rouvrir`}
-                      >
-                        <span style={{fontSize:10,color:'#999',fontFamily:'IBM Plex Mono,monospace',fontWeight:700,background:'rgba(255,255,255,.7)',padding:'1px 5px',borderRadius:3}}>🔒 FERMÉ</span>
-                      </div>
-                    );
-                  }
-                  return(
-                    <div key={'e1'+sci} style={{
-                      gridRow:r1,gridColumn:sci+2,
-                      background:dragOver===k?'#edf5e0':date===today?'rgba(255,215,0,0.06)':isM?'#fafaf8':'#f5f5f2',
-                      borderBottom:'1px solid rgba(0,0,0,.04)',
-                      borderRight:isM?'none':'1px solid #dddbd3',
-                      cursor:isLocked?'default':'pointer',position:'relative'
-                    }}
-                      onDragOver={isLocked?undefined:e=>onDO(e,k)} onDragLeave={isLocked?undefined:onDL}
-                      onDrop={isLocked?undefined:e=>onDrop(e,machine,date,hd,1)}
-                      onClick={isLocked?undefined:()=>setModal({type:'add',data:{...base,machine,date,half_day:hd,slot:1}})}
-                    />
-                  );
-                })}
-
-                {/* GUTTER row — bande blanche séparatrice entre machines */}
-                <div style={{
-                  gridRow:r1+1, gridColumn:'1/'+(nSC+2),
-                  background:'#fff',
-                  position:'sticky',left:0,
-                }}/>
-
+                {regimeEls[machine]}
+                {opRowEls[machine]}
+                {bandEls[machine]}
+                {emptyEls[machine]}
+                <div style={{gridRow:r1+1,gridColumn:'1/'+(nSC+2),background:'#fff',position:'sticky',left:0}}/>
               </React.Fragment>
             );
           })}
 
-          {/* VIRTUAL ROWS — opérateur seul (Manutention, Bureau, Absent×3) */}
           {VIRTUAL_ROWS.map((vr,vi)=>{
-            const baseRow=3+MACHINES.length*4;
-            const rV=baseRow+vi*2;
-            const rGut=rV+1;
+            const rV=3+MACHINES.length*4+vi*2;
             return(
               <React.Fragment key={'vr_'+vr.key}>
-                {/* LABEL */}
-                <div style={{
-                  gridRow:rV, gridColumn:1,
-                  position:'sticky',left:0,zIndex:5,
-                  background:vr.bg,borderRight:'2px solid #b8b5aa',
-                  padding:'0 10px',display:'flex',alignItems:'center',
-                  height:ROH,
-                }}>
+                <div style={{gridRow:rV,gridColumn:1,position:'sticky',left:0,zIndex:5,background:vr.bg,borderRight:'2px solid #b8b5aa',
+                  padding:'0 10px',display:'flex',alignItems:'center',height:ROH}}>
                   <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:12,fontWeight:700,color:vr.text,letterSpacing:.5}}>{vr.label}</div>
                 </div>
-
-                {/* OPERATOR CELLS — dropdown par demi-journée */}
-                {filteredSubCols.map((sc,sci)=>{
-                  const k=vr.key+'|'+sc.date+'|'+sc.hd;
-                  const assignedId=opAssign[k];
-                  const op=assignedId?operators.find(o=>o.id===assignedId):null;
-                  const bg=op?op.color:'transparent';
-                  const fg=op?textOnColor(op.color):'#888';
-                  const availOps=operators.filter(o=>!o.archived);
-                  return(
-                    <div key={'vop'+vr.key+sc.date+sc.hd}
-                      style={{
-                        gridRow:rV, gridColumn:sci+2,
-                        background:bg,
-                        borderBottom:'1px solid #d8d8d0',
-                        borderRight:'1px solid #e8e5e2',
-                        display:'flex',alignItems:'center',justifyContent:'center',
-                        position:'relative',padding:0,
-                      }}
-                      title={op?op.nom:'Aucun opérateur'}
-                    >
-                      <select
-                        value={assignedId||''}
-                        disabled={isLocked}
-                        onChange={e=>{
-                          const v=e.target.value;
-                          setOperatorAssignment(vr.key,sc.date,sc.hd,v===''?null:v);
-                        }}
-                        style={{
-                          width:'100%',height:'100%',
-                          border:'none',outline:'none',
-                          background:'transparent',color:fg,
-                          fontFamily:'IBM Plex Mono,monospace',
-                          fontSize:11,fontWeight:700,letterSpacing:.3,
-                          textAlign:'center',textAlignLast:'center',
-                          cursor:isLocked?'default':'pointer',
-                          appearance:'none',WebkitAppearance:'none',MozAppearance:'none',
-                          padding:0,
-                        }}
-                      >
-                        <option value="" style={{background:'#fff',color:'#888'}}>—</option>
-                        {availOps.map(o=>(
-                          <option key={o.id} value={o.id}
-                            style={{background:o.color,color:textOnColor(o.color),fontWeight:700}}>
-                            {o.abrev}
-                          </option>
-                        ))}
-                      </select>
-                      {op&&(
-                        <span style={{
-                          position:'absolute',pointerEvents:'none',
-                          fontFamily:'IBM Plex Mono,monospace',
-                          fontSize:11,fontWeight:800,letterSpacing:.3,
-                          color:fg,
-                        }}>{op.abrev}</span>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* GUTTER */}
-                <div style={{
-                  gridRow:rGut, gridColumn:'1/'+(nSC+2),
-                  background:'#fff',position:'sticky',left:0,
-                }}/>
+                {opRowEls[vr.key]}
+                <div style={{gridRow:rV+1,gridColumn:'1/'+(nSC+2),background:'#fff',position:'sticky',left:0}}/>
               </React.Fragment>
             );
           })}
         </div>
       </div>
 
+      {opPicker&&<OpPicker picker={opPicker} operators={operators} current={opAssign[opPicker.machine+'|'+opPicker.date+'|'+opPicker.hd]}
+        onPick={id=>{const p=opPicker;setOpPicker(null);setOperatorAssignment(p.machine,p.date,p.hd,id);}}
+        onClose={()=>setOpPicker(null)}/>}
+
       {readonlyPopup&&(
         <div style={{position:'fixed',inset:0,zIndex:200}} onClick={()=>setReadonlyPopup(null)}>
-          <div style={{
-            position:'fixed',
-            left:Math.min(readonlyPopup.x+8, window.innerWidth-280),
-            top:Math.min(readonlyPopup.y+8, window.innerHeight-240),
-            width:260,background:'#1a1916',borderRadius:10,
-            padding:'16px 18px',boxShadow:'0 8px 32px rgba(0,0,0,.5)',
-            border:'1px solid #c9a84c',zIndex:201,
-          }} onClick={e=>e.stopPropagation()}>
+          <div style={{position:'fixed',left:Math.min(readonlyPopup.x+8, window.innerWidth-280),top:Math.min(readonlyPopup.y+8, window.innerHeight-240),
+            width:260,background:'#1a1916',borderRadius:10,padding:'16px 18px',boxShadow:'0 8px 32px rgba(0,0,0,.5)',border:'1px solid #c9a84c',zIndex:201}}
+            onClick={e=>e.stopPropagation()}>
             <div style={{fontFamily:'IBM Plex Mono,monospace',fontSize:10,color:'#c9a84c',letterSpacing:1,marginBottom:10,textTransform:'uppercase'}}>
               {readonlyPopup.band.fr.machine} · {readonlyPopup.band.fr.date}
             </div>
@@ -2271,9 +1766,7 @@ function App(){
             )}
             {readonlyPopup.band.depart&&<div style={{fontSize:12,color:'#aaa',marginBottom:4}}>Départ : <strong style={{color:'#f5d97a'}}>{readonlyPopup.band.depart}</strong></div>}
             {getObs(readonlyPopup.band.fr)&&(
-              <div style={{fontSize:12,color:'#ccc',marginTop:8,paddingTop:8,borderTop:'1px solid #333',whiteSpace:'pre-wrap'}}>
-                {getObs(readonlyPopup.band.fr)}
-              </div>
+              <div style={{fontSize:12,color:'#ccc',marginTop:8,paddingTop:8,borderTop:'1px solid #333',whiteSpace:'pre-wrap'}}>{getObs(readonlyPopup.band.fr)}</div>
             )}
             <div style={{textAlign:'right',marginTop:10}}>
               <button onClick={()=>setReadonlyPopup(null)} style={{padding:'4px 12px',borderRadius:5,border:'1px solid #444',background:'transparent',color:'#aaa',fontSize:12,cursor:'pointer'}}>Fermer</button>
@@ -2283,38 +1776,58 @@ function App(){
       )}
       {modal&&<EditModal modal={modal} onClose={()=>setModal(null)} onSave={onSave} onDel={onDel} onShift={onShift} onResize={onResize} rows={activeRows} subCols={subCols} dates={activeDates} sets={sets} sat={sat} clients={clients} onCloseMachine={saveClosure}/>}
       {showSet&&<Settings sets={sets} onChange={upd} onClose={()=>setShowSet(false)}/>}
-      {showClients&&<ClientsManager onClose={()=>{setShowClients(false);load();}}/>}
-      {showOperators&&<OperatorsManager onClose={()=>{setShowOperators(false);load();}}/>}
+      {showClients&&<ClientsManager onClose={()=>{setShowClients(false);sbAll('clients?order=nom&select=nom').then(d=>setClients((d||[]).map(c=>c.nom))).catch(()=>{});}}/>}
+      {showOperators&&<OperatorsManager onClose={()=>{setShowOperators(false);loadAux();}}/>}
       {showBackups&&<BackupModal onClose={()=>setShowBackups(false)} loadBackups={loadBackups} restoreBackup={restoreBackup} showToast={showToast} reload={load} createManualBackup={createManualBackup}
         onPreview={async(backupId,backupDate)=>{
           try{
             const data=await sb('planning_backups?id=eq.'+backupId+'&select=snapshot');
             if(!data||data.length===0) throw new Error('Snapshot introuvable');
-            const snapshotRows=JSON.parse(data[0].snapshot);
-            setPreviewData({rows:snapshotRows, backupId, backupDate});
+            setPreviewData({rows:JSON.parse(data[0].snapshot), backupId, backupDate});
             setShowBackups(false);
           }catch(e){showToast('Erreur chargement snapshot : '+e.message);}
         }}
       />}
-      {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines}
-        onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
+      {satModal&&<SaturdayModal date={satModal.date} machines={satModal.machines} onClose={()=>setSatModal(null)} onSave={saveSatConfig}/>}
       {toast&&<div className="toast">{toast}</div>}
-      {syncPaused && !READONLY && (
-        <div style={{
-          position:'fixed', bottom:24, left:24, zIndex:300, maxWidth:340,
-          background:'#1a1916', border:'1px solid #c9a84c', color:'#f5f4f0',
-          padding:'11px 18px', borderRadius:6, fontSize:12, lineHeight:1.5,
-          fontFamily:"'IBM Plex Sans',sans-serif"
-        }}>
-          <b>⏸ Synchronisation automatique en pause</b><br/>
-          Les rafraîchissements ont lieu du lundi au vendredi, de 7h30 à 18h00.
-          Les données affichées peuvent ne plus être à jour — rechargez la page (F5)
-          pour forcer une mise à jour.
-        </div>
-      )}
     </div>
   );
 }
+
+// Panneau de choix d'un opérateur (un seul pour toute la grille)
+function OpPicker({picker,operators,current,onPick,onClose}){
+  const list=operators.filter(o=>!o.archived).sort((a,b)=>(a.nom||'').localeCompare(b.nom||''));
+  const isWeek=pd(picker.date).getDay()===1&&picker.hd===1;
+  const left=Math.min(picker.x,window.innerWidth-200);
+  const top=Math.min(picker.y,window.innerHeight-Math.min(420,60+list.length*30));
+  const item=(sel)=>({display:'flex',alignItems:'center',gap:8,padding:'5px 8px',borderRadius:4,cursor:'pointer',fontSize:12,
+    background:sel?'#f5f3ed':'transparent',fontWeight:sel?700:400});
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:250}} onClick={onClose}>
+      <div style={{position:'fixed',left,top,width:190,maxHeight:420,overflowY:'auto',background:'#fff',borderRadius:8,
+        border:'1px solid #c9a84c',boxShadow:'0 8px 24px rgba(0,0,0,.25)',padding:6,zIndex:251}}
+        onClick={e=>e.stopPropagation()}>
+        <div style={{fontSize:10,color:'#8a8880',fontFamily:'IBM Plex Mono,monospace',padding:'2px 6px 6px',borderBottom:'1px solid #eee',marginBottom:4}}>
+          {picker.machine} · {picker.date} · {picker.hd===1?'matin':'après-midi'}
+          {isWeek&&<div style={{color:'#8a6a20',marginTop:2}}>Lundi matin : toute la semaine</div>}
+        </div>
+        <div style={item(!current)} onClick={()=>onPick(null)}
+          onMouseEnter={e=>e.currentTarget.style.background='#f0efe9'} onMouseLeave={e=>e.currentTarget.style.background=!current?'#f5f3ed':'transparent'}>
+          <span style={{width:30,textAlign:'center',color:'#999'}}>—</span> Aucun
+        </div>
+        {list.map(o=>(
+          <div key={o.id} style={item(current===o.id)} onClick={()=>onPick(o.id)}
+            onMouseEnter={e=>e.currentTarget.style.background='#f0efe9'} onMouseLeave={e=>e.currentTarget.style.background=current===o.id?'#f5f3ed':'transparent'}>
+            <span style={{width:30,textAlign:'center',borderRadius:3,padding:'2px 0',background:o.color,color:textOnColor(o.color),
+              fontFamily:'IBM Plex Mono,monospace',fontSize:11,fontWeight:800}}>{o.abrev}</span>
+            <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{o.nom}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 
 function EditModal({modal,onClose,onSave,onDel,onShift,onResize,rows,subCols,dates,sets,sat,clients,onCloseMachine}){
   const isEdit=modal.type==='edit';
