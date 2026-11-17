@@ -661,7 +661,21 @@ async function sbDeleteIds(ids){
     await sb('planning?id=in.('+part+')',{method:'DELETE',prefer:'return=minimal'});
   }
 }
+// Colonnes écrites en base. Toutes les lignes d'un même envoi doivent porter
+// EXACTEMENT les mêmes champs, sinon Supabase refuse tout le lot (PGRST102) :
+// les lignes chargées n'ont pas « updated_at », celles revenues d'un
+// enregistrement ou du temps réel l'ont.
+var PLANNING_WRITE_COLS=['date','machine','slot','half_day','of_number','client','designation','mac','qte','format','depart','conducteur','bold'];
+function normRow(r){
+  var o={};
+  PLANNING_WRITE_COLS.forEach(function(k){o[k]=(r[k]===undefined?null:r[k]);});
+  if(o.half_day===null) o.half_day=1;
+  if(o.bold===null) o.bold=false;
+  if(o.format===null) o.format='';
+  return o;
+}
 async function sbInsertRows(rowsArr){
+  rowsArr=rowsArr.map(normRow);
   let out=[];
   for(let i=0;i<rowsArr.length;i+=400){
     const res=await sb('planning',{method:'POST',body:JSON.stringify(rowsArr.slice(i,i+400)),prefer:'return=representation'});
@@ -832,7 +846,7 @@ function App(){
       const existing=await sbAll('planning?select=id&order=id');
       if(existing&&existing.length>0) await sbDeleteIds(existing.map(r=>r.id));
       for(let i=0;i<snapshot.length;i+=200){
-        const chunk=snapshot.slice(i,i+200).map(stripId);
+        const chunk=snapshot.slice(i,i+200).map(normRow);
         await sb('planning',{method:'POST',body:JSON.stringify(chunk),prefer:'return=minimal'});
       }
       // Les identifiants ont tous changé : l'historique Ctrl+Z n'est plus valable
@@ -918,7 +932,18 @@ function App(){
       return await sbInsertRows(addRows.map(stripId));
     }catch(e){
       if(rmIds.length){
-        try{const back=await sbInsertRows(removeRows.map(stripId));mapIds(removeRows,back);}catch(e2){}
+        try{const back=await sbInsertRows(removeRows.map(stripId));mapIds(removeRows,back);}
+        catch(e2){
+          // Remise en place impossible : on garde une copie locale des lignes
+          // retirées et on le dit clairement, au lieu de les perdre en silence.
+          try{
+            const k='pdd_rescue';const prev=JSON.parse(localStorage.getItem(k)||'[]');
+            prev.push({at:new Date().toISOString(),rows:removeRows.map(normRow)});
+            localStorage.setItem(k,JSON.stringify(prev.slice(-20)));
+          }catch(e3){}
+          console.error('[PDD] lignes retirées non remises en place',removeRows,e2);
+          throw new Error('ATTENTION '+removeRows.length+' demi-journée(s) retirée(s) et NON remise(s) en place — ne rien modifier, restaurer la dernière sauvegarde. '+String(e.message||e));
+        }
       }
       throw e;
     }
@@ -950,7 +975,7 @@ function App(){
       if(toastMsg) showToast(toastMsg);
       return true;
     }catch(e){
-      showToast('Erreur : '+String(e.message||e).slice(0,120)+' — planning rechargé');
+      showToast('Erreur : '+String(e.message||e).slice(0,260)+' — planning rechargé');
       await load();
       return false;
     }finally{
