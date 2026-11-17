@@ -674,6 +674,11 @@ function normRow(r){
   if(o.format===null) o.format='';
   return o;
 }
+// Suppression + insertion atomiques (fonction Supabase planning_apply).
+async function sbApply(rmIds,addRows){
+  const res=await sb('rpc/planning_apply',{method:'POST',body:JSON.stringify({remove_ids:rmIds,add_rows:addRows.map(normRow)}),prefer:'return=representation'});
+  return res||[];
+}
 async function sbInsertRows(rowsArr){
   rowsArr=rowsArr.map(normRow);
   let out=[];
@@ -843,12 +848,10 @@ function App(){
       const data=await sb('planning_backups?id=eq.'+backupId+'&select=snapshot');
       if(!data||data.length===0) throw new Error('Sauvegarde introuvable');
       const snapshot=JSON.parse(data[0].snapshot);
+      if(!Array.isArray(snapshot)||!snapshot.length) throw new Error('Sauvegarde vide');
       const existing=await sbAll('planning?select=id&order=id');
-      if(existing&&existing.length>0) await sbDeleteIds(existing.map(r=>r.id));
-      for(let i=0;i<snapshot.length;i+=200){
-        const chunk=snapshot.slice(i,i+200).map(normRow);
-        await sb('planning',{method:'POST',body:JSON.stringify(chunk),prefer:'return=minimal'});
-      }
+      // Une seule opération : en cas d'échec, le planning actuel reste intact.
+      await sbApply((existing||[]).map(r=>r.id),snapshot);
       // Les identifiants ont tous changé : l'historique Ctrl+Z n'est plus valable
       histRef.current={undo:[],redo:[]}; idMapRef.current=new Map(); setHistTick(t=>t+1);
       return true;
@@ -925,28 +928,11 @@ function App(){
   // Écriture planning : suppression puis insertion, avec remise en place si
   // l'insertion échoue.
   async function dbApply(removeRows,addRows){
+    // Suppression + insertion en UNE seule opération côté base (fonction
+    // planning_apply) : si l'insertion échoue, rien n'est supprimé.
     const rmIds=[...new Set(removeRows.map(r=>r.id))];
-    if(rmIds.length) await sbDeleteIds(rmIds);
-    if(!addRows.length) return [];
-    try{
-      return await sbInsertRows(addRows.map(stripId));
-    }catch(e){
-      if(rmIds.length){
-        try{const back=await sbInsertRows(removeRows.map(stripId));mapIds(removeRows,back);}
-        catch(e2){
-          // Remise en place impossible : on garde une copie locale des lignes
-          // retirées et on le dit clairement, au lieu de les perdre en silence.
-          try{
-            const k='pdd_rescue';const prev=JSON.parse(localStorage.getItem(k)||'[]');
-            prev.push({at:new Date().toISOString(),rows:removeRows.map(normRow)});
-            localStorage.setItem(k,JSON.stringify(prev.slice(-20)));
-          }catch(e3){}
-          console.error('[PDD] lignes retirées non remises en place',removeRows,e2);
-          throw new Error('ATTENTION '+removeRows.length+' demi-journée(s) retirée(s) et NON remise(s) en place — ne rien modifier, restaurer la dernière sauvegarde. '+String(e.message||e));
-        }
-      }
-      throw e;
-    }
+    if(!rmIds.length&&!addRows.length) return [];
+    return await sbApply(rmIds,addRows);
   }
 
   // Exécute une action : affichage immédiat, enregistrement en arrière-plan,
